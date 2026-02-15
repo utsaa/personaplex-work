@@ -217,12 +217,24 @@ def generate_video_clip(
 # Thread: video generation (audio_queue -> diffusion -> frame_queue)
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Utility: RMS energy of an audio buffer
+# ---------------------------------------------------------------------------
+
+def _rms(audio: np.ndarray) -> float:
+    """Return the root-mean-square energy of a float32 PCM buffer."""
+    if len(audio) == 0:
+        return 0.0
+    return float(np.sqrt(np.mean(audio ** 2)))
+
+
 def video_generation_thread(
     pipe, ref_image, pose_dir, pose_files,
     audio_queue, frame_queue, stop_event,
     sample_rate=16000, fps=24, clip_frames=12,
     W=512, H=512, steps=4, cfg=1.0,
     audio_out_queue=None,
+    vad_threshold=0.005,
 ):
     samples_per_clip = int(sample_rate * clip_frames / fps)
     audio_buffer = np.array([], dtype=np.float32)
@@ -230,6 +242,8 @@ def video_generation_thread(
 
     print(f"[GEN] Waiting for audio (need {samples_per_clip} samples = "
           f"{clip_frames/fps:.2f}s per clip) ...")
+    print(f"[GEN] Server-side VAD threshold: {vad_threshold:.4f} "
+          f"({'enabled' if vad_threshold > 0 else 'disabled'})")
 
     while not stop_event.is_set():
         # Drain audio_queue into buffer
@@ -245,6 +259,14 @@ def video_generation_thread(
 
         clip_audio = audio_buffer[:samples_per_clip]
         audio_buffer = audio_buffer[samples_per_clip:]
+
+        # --- Server-side silence gate (layers 2 & 3) -----------------------
+        clip_rms = _rms(clip_audio)
+        if vad_threshold > 0 and clip_rms < vad_threshold:
+            # Silence — skip expensive diffusion, discard the clip
+            print(f"[GEN] Silent clip discarded (RMS={clip_rms:.5f} < {vad_threshold:.4f})")
+            continue
+        # -------------------------------------------------------------------
 
         tmp_wav_path = None
         try:
@@ -323,7 +345,7 @@ async def run_server(pipe, ref_image, pose_dir, pose_files, args):
             args.sample_rate, args.fps, args.clip_frames,
             args.width, args.height, args.steps, args.cfg,
         ),
-        kwargs={"audio_out_queue": audio_out_queue},
+        kwargs={"audio_out_queue": audio_out_queue, "vad_threshold": args.vad_threshold},
         daemon=True,
     )
     gen_thread.start()
@@ -430,6 +452,9 @@ def main():
     parser.add_argument("--steps", type=int, default=4)
     parser.add_argument("--cfg", type=float, default=1.0)
     parser.add_argument("--port", type=int, default=8080)
+    parser.add_argument("--vad-threshold", type=float, default=0.005,
+                        help="Server-side RMS silence threshold (0.0 = disabled). "
+                             "Clips below this are discarded.")
     args = parser.parse_args()
 
     pipe = load_pipeline(args.config, DEVICE, WEIGHT_DTYPE)

@@ -6,13 +6,11 @@ requires-python = "==3.11.9"
 dependencies = [
     "aiohttp>=3.9",
     "opencv-python-headless>=4.8",
-    "torch>=2.0",
     "diffusers==0.31.0",
     "omegaconf==2.3.0",
-    "numpy==1.26.4",
     "Pillow>=10.2.0,<10.3.0",
-    "transformers>=4.46.3,<5",
-    "accelerate==1.1.1",
+    "transformers>=4.46.0",
+    "accelerate>=1.1.1",
     "einops==0.8.0",
     "ffmpeg-python",
     "soundfile",
@@ -24,9 +22,14 @@ dependencies = [
     "librosa>=0.11.0",
     "nvidia-cublas-cu12 ; sys_platform == 'win32'",
     "nvidia-cudnn-cu12 ; sys_platform == 'win32'",
+    # Note: Removed version pin from here so uv looks at sources instead
+    "torch",
+    "torchvision",
+    "torchaudio",
 ]
 
 [project.optional-dependencies]
+# Toggle this extra on RunPod to force Blackwell/5090 compatibility
 blackwell = []
 
 [project.scripts]
@@ -37,16 +40,32 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [tool.uv]
+prerelease = "allow"
 package = true
+# This limits uv's "thinking" to just x86_64 Linux (our container platform)
 environments = [
     "sys_platform == 'win32'",
-    "sys_platform == 'linux'",
+    "sys_platform == 'linux' and platform_machine == 'x86_64'",
 ]
 
+# Block broken nightly ONNX builds
+override-dependencies = [
+    "transformers==4.40.0",
+    "onnxruntime==1.20.1",
+    "onnxruntime-gpu==1.20.1",
+]
+
+# CUDA 12.6 index for PyTorch
 [[tool.uv.index]]
 name = "pytorch-gpu"
 url = "https://download.pytorch.org/whl/cu126"
 explicit = true
 
+# NOTE: Blackwell/cu128 nightly index removed for now — nightly torch >=2.11.0.dev
+# is incompatible with whisperx's torch<2.9.dev0 constraint. Re-add once stable
+# cu128 builds land or whisperx relaxes the upper bound.
+
 [tool.uv.sources]
 torch = { index = "pytorch-gpu" }
+torchvision = { index = "pytorch-gpu" }
+torchaudio = { index = "pytorch-gpu" }

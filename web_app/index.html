@@ -18,8 +18,20 @@
   <button id="stopBtn" onclick="stop()" disabled>Stop</button>
 </div>
 <div id="status">Click Start to begin.</div>
+<div id="vad-indicator" style="font-size:12px;color:#555;margin:4px;">VAD: idle</div>
 <script>
 let ws, micCtx, source, processor, stream, playCtx, playNextTime;
+
+// Client-side Voice Activity Detection (RMS threshold)
+const VAD_RMS_THRESHOLD = 0.008;   // ~-42 dBFS – adjust if needed
+const VAD_HOLD_CHUNKS   = 6;       // keep sending for N chunks after speech stops
+let vadHoldCounter = 0;
+
+function computeRMS(pcm) {
+  let sum = 0;
+  for (let i = 0; i < pcm.length; i++) sum += pcm[i] * pcm[i];
+  return Math.sqrt(sum / pcm.length);
+}
 
 function setStatus(msg) {
   document.getElementById('status').textContent = msg;
@@ -40,7 +52,23 @@ async function start() {
       processor.onaudioprocess = (e) => {
         if (ws && ws.readyState === WebSocket.OPEN) {
           const pcm = e.inputBuffer.getChannelData(0);
-          ws.send(new Float32Array(pcm).buffer);
+          const rms = computeRMS(pcm);
+          const indicator = document.getElementById('vad-indicator');
+
+          if (rms >= VAD_RMS_THRESHOLD) {
+            // Speech detected – send and reset hold counter
+            vadHoldCounter = VAD_HOLD_CHUNKS;
+            ws.send(new Float32Array(pcm).buffer);
+            if (indicator) { indicator.textContent = 'VAD: speaking \u{1F50A}'; indicator.style.color = '#0f0'; }
+          } else if (vadHoldCounter > 0) {
+            // Tail – keep sending briefly after speech ends
+            vadHoldCounter--;
+            ws.send(new Float32Array(pcm).buffer);
+            if (indicator) { indicator.textContent = 'VAD: tail...'; indicator.style.color = '#aa0'; }
+          } else {
+            // Silence – do NOT send
+            if (indicator) { indicator.textContent = 'VAD: silent'; indicator.style.color = '#555'; }
+          }
         }
       };
       source.connect(processor);
