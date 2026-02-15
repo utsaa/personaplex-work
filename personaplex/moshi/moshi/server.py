@@ -1,0 +1,830 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: MIT
+#
+# Permission is hereby granted, free of charge, to any person obtaining a
+# copy of this software and associated documentation files (the "Software"),
+# to deal in the Software without restriction, including without limitation
+# the rights to use, copy, modify, merge, publish, distribute, sublicense,
+# and/or sell copies of the Software, and to permit persons to whom the
+# Software is furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+# THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+# FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+# DEALINGS IN THE SOFTWARE.
+
+
+# Copyright (c) Kyutai, all rights reserved.
+# This source code is licensed under the license found in the
+# LICENSE file in the root directory of this source tree.
+
+import argparse
+import asyncio
+from dataclasses import dataclass
+import random
+import os
+from pathlib import Path
+import tarfile
+import time
+import secrets
+import sys
+from typing import Literal, Optional
+
+import aiohttp
+from aiohttp import web
+from huggingface_hub import hf_hub_download
+import numpy as np
+import sentencepiece
+import sphn
+import torch
+import random
+import cv2
+import wave
+import tempfile
+from PIL import Image
+
+from .client_utils import make_log, colorize
+from .models import loaders, MimiModel, LMModel, LMGen
+from .utils.connection import create_ssl_context, get_lan_ip
+from .utils.logging import setup_logger, ColorizedLog
+
+
+logger = setup_logger(__name__)
+DeviceString = Literal["cuda"] | Literal["cpu"] #| Literal["mps"]
+
+def torch_auto_device(requested: Optional[DeviceString] = None) -> torch.device:
+    """Return a torch.device based on the requested string or availability."""
+    if requested is not None:
+        return torch.device(requested)
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    #elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+    #    return torch.device("mps")
+    return torch.device("cpu")
+
+
+def seed_all(seed):
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)  # for multi-GPU setups
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.backends.cudnn.deterministic = False
+    torch.backends.cudnn.benchmark = False
+
+
+def wrap_with_system_tags(text: str) -> str:
+    """Add system tags as the model expects if they are missing.
+    Example: "<system> You enjoy having a good conversation. Have a deep conversation about technology. Your name is Jane. <system>"
+    """
+    cleaned = text.strip()
+    if cleaned.startswith("<system>") and cleaned.endswith("<system>"):
+        return cleaned
+    return f"<system> {cleaned} <system>"
+
+
+@dataclass
+class ServerState:
+    mimi: MimiModel
+    other_mimi: MimiModel
+    text_tokenizer: sentencepiece.SentencePieceProcessor
+    lm_gen: LMGen
+    lock: asyncio.Lock
+
+    def __init__(self, mimi: MimiModel, other_mimi: MimiModel, text_tokenizer: sentencepiece.SentencePieceProcessor,
+                 lm: LMModel, device: str | torch.device, voice_prompt_dir: str | None = None,
+                 save_voice_prompt_embeddings: bool = False,
+                 enable_video: bool = False, reference_image_path: str | None = None,
+                 echomimic_dir: str | None = None, pose_dir: str | None = None,
+                 video_width: int = 512, video_height: int = 512,
+                 video_fps: int = 24, video_clip_frames: int = 12):
+        self.mimi = mimi
+        self.other_mimi = other_mimi
+        self.text_tokenizer = text_tokenizer
+        self.device = device
+        self.voice_prompt_dir = voice_prompt_dir
+        self.echomimic = None
+        self.reference_image = None
+        self.pose_dir = pose_dir
+        self.video_width = video_width
+        self.video_height = video_height
+        self.video_fps = video_fps
+        self.video_clip_frames = video_clip_frames
+        self._pose_files = None
+        self._draw_pose_select_v2 = None
+        self.frame_size = int(self.mimi.sample_rate / self.mimi.frame_rate)
+        self.lm_gen = LMGen(lm,
+                            audio_silence_frame_cnt=int(0.5 * self.mimi.frame_rate),
+                            sample_rate=self.mimi.sample_rate,
+                            device=device,
+                            frame_rate=self.mimi.frame_rate,
+                            save_voice_prompt_embeddings=save_voice_prompt_embeddings,
+        )
+        
+        self.lock = asyncio.Lock()
+        self.mimi.streaming_forever(1)
+        self.other_mimi.streaming_forever(1)
+        self.lm_gen.streaming_forever(1)
+
+        # Load EchoMimic-v2 accelerated model if video is enabled
+        if enable_video:
+            assert echomimic_dir is not None, "--echomimic-dir is required when --enable-video is set"
+            assert pose_dir is not None, "--pose-dir is required when --enable-video is set"
+            assert reference_image_path is not None, "--reference-image is required when --enable-video is set"
+            try:
+                logger.info("loading echomimic-v2 (acc) models...")
+                # Ensure echomimic_v2 parent is on path for imports
+                echomimic_parent = os.path.dirname(os.path.abspath(echomimic_dir))
+                if echomimic_parent not in sys.path:
+                    sys.path.insert(0, echomimic_parent)
+
+                from echomimic_v2.src.pipelines.pipeline_echomimicv2_acc import EchoMimicV2Pipeline
+                from echomimic_v2.src.models.unet_2d_condition import UNet2DConditionModel
+                from echomimic_v2.src.models.unet_3d_emo import EMOUNet3DConditionModel
+                from echomimic_v2.src.models.whisper.audio2feature import load_audio_model
+                from echomimic_v2.src.models.pose_encoder import PoseEncoder
+                from echomimic_v2.src.utils.dwpose_util import draw_pose_select_v2
+                from diffusers import AutoencoderKL, DDIMScheduler
+                from omegaconf import OmegaConf
+
+                self._draw_pose_select_v2 = draw_pose_select_v2
+                weights_dir = os.path.join(echomimic_dir, "pretrained_weights")
+                infer_config_path = os.path.join(echomimic_dir, "configs", "inference", "inference_v2.yaml")
+                infer_config = OmegaConf.load(infer_config_path)
+                weight_dtype = torch.float16
+
+                # VAE
+                logger.info("  loading VAE...")
+                vae = AutoencoderKL.from_pretrained(
+                    os.path.join(weights_dir, "sd-vae-ft-mse"),
+                    local_files_only=True,
+                    torch_dtype=weight_dtype,
+                ).to(device, dtype=weight_dtype)
+
+                # Reference UNet (2D)
+                logger.info("  loading reference UNet...")
+                reference_unet = UNet2DConditionModel.from_pretrained(
+                    os.path.join(weights_dir, "sd-image-variations-diffusers"),
+                    subfolder="unet",
+                ).to(dtype=weight_dtype, device=device)
+                reference_unet.load_state_dict(
+                    torch.load(os.path.join(weights_dir, "reference_unet.pth"), map_location="cpu"),
+                )
+
+                # Denoising UNet (3D with motion module)
+                logger.info("  loading denoising UNet (acc)...")
+                motion_module_path = os.path.join(weights_dir, "motion_module_acc.pth")
+                denoising_unet = EMOUNet3DConditionModel.from_pretrained_2d(
+                    os.path.join(weights_dir, "sd-image-variations-diffusers"),
+                    motion_module_path,
+                    subfolder="unet",
+                    unet_additional_kwargs=OmegaConf.to_container(infer_config.unet_additional_kwargs),
+                ).to(dtype=weight_dtype, device=device)
+                denoising_unet.load_state_dict(
+                    torch.load(os.path.join(weights_dir, "denoising_unet_acc.pth"), map_location="cpu"),
+                    strict=False,
+                )
+
+                # Pose encoder
+                logger.info("  loading pose encoder...")
+                pose_net = PoseEncoder(
+                    320, conditioning_channels=3, block_out_channels=(16, 32, 96, 256)
+                ).to(dtype=weight_dtype, device=device)
+                pose_net.load_state_dict(
+                    torch.load(os.path.join(weights_dir, "pose_encoder.pth"), map_location="cpu")
+                )
+
+                # Audio processor (Whisper tiny)
+                logger.info("  loading audio processor (whisper tiny)...")
+                audio_processor = load_audio_model(
+                    model_path=os.path.join(weights_dir, "audio_processor", "tiny.pt"),
+                    device=str(device),
+                )
+
+                # Scheduler
+                sched_kwargs = OmegaConf.to_container(infer_config.noise_scheduler_kwargs)
+                scheduler = DDIMScheduler(**sched_kwargs)
+
+                # Build pipeline
+                self.echomimic = EchoMimicV2Pipeline(
+                    vae=vae,
+                    reference_unet=reference_unet,
+                    denoising_unet=denoising_unet,
+                    audio_guider=audio_processor,
+                    pose_encoder=pose_net,
+                    scheduler=scheduler,
+                )
+                self.echomimic = self.echomimic.to(device, dtype=weight_dtype)
+                logger.info("echomimic-v2 (acc) pipeline loaded")
+            except Exception as e:
+                logger.warning(f"Failed to load echomimic-v2: {e}. Video disabled.")
+                import traceback
+                traceback.print_exc()
+                self.echomimic = None
+
+            # Load reference image for face animation (PIL Image for pipeline)
+            if reference_image_path is not None and os.path.exists(reference_image_path):
+                self.reference_image = Image.open(reference_image_path).convert("RGB")
+                logger.info(f"loaded reference image: {reference_image_path}")
+            elif self.echomimic is not None:
+                logger.warning("echomimic enabled but no --reference-image provided")
+
+            # Cache sorted pose file list
+            if self.pose_dir is not None and os.path.isdir(self.pose_dir):
+                self._pose_files = sorted(
+                    [f for f in os.listdir(self.pose_dir) if f.endswith('.npy')],
+                    key=lambda x: int(os.path.splitext(x)[0]),
+                )
+                logger.info(f"loaded {len(self._pose_files)} pose files from {self.pose_dir}")
+            elif self.echomimic is not None:
+                logger.warning("echomimic enabled but no --pose-dir provided or directory is empty")
+    
+    def warmup(self):
+        for _ in range(4):
+            chunk = torch.zeros(1, 1, self.frame_size, dtype=torch.float32, device=self.device)
+            codes = self.mimi.encode(chunk)
+            _ = self.other_mimi.encode(chunk)
+            for c in range(codes.shape[-1]):
+                tokens = self.lm_gen.step(codes[:, :, c: c + 1])
+                if tokens is None:
+                    continue
+                _ = self.mimi.decode(tokens[:, 1:9])
+                _ = self.other_mimi.decode(tokens[:, 1:9])
+
+        if self.device.type == 'cuda':
+            torch.cuda.synchronize()
+
+    def _prepare_pose_tensor(self, num_frames: int, start_idx: int = 0) -> torch.Tensor:
+        """Build (1, 3, L, H, W) pose tensor from .npy files, cycling if needed."""
+        weight_dtype = torch.float16
+        W, H = self.video_width, self.video_height
+        num_available = len(self._pose_files)
+        pose_list = []
+        for i in range(num_frames):
+            idx = (start_idx + i) % num_available
+            tgt_musk = np.zeros((W, H, 3), dtype=np.uint8)
+            tgt_musk_path = os.path.join(self.pose_dir, self._pose_files[idx])
+            detected_pose = np.load(tgt_musk_path, allow_pickle=True).tolist()
+            imh_new, imw_new, rb, re, cb, ce = detected_pose['draw_pose_params']
+            im = self._draw_pose_select_v2(detected_pose, imh_new, imw_new, ref_w=800)
+            im = np.transpose(np.array(im), (1, 2, 0))
+            tgt_musk[rb:re, cb:ce, :] = im
+            tgt_musk_pil = Image.fromarray(tgt_musk).convert('RGB')
+            pose_list.append(
+                torch.Tensor(np.array(tgt_musk_pil))
+                .to(dtype=weight_dtype, device=self.device)
+                .permute(2, 0, 1) / 255.0
+            )
+        poses_tensor = torch.stack(pose_list, dim=1).unsqueeze(0)
+        return poses_tensor
+
+    def _generate_video_clip(self, wav_path: str, poses_tensor: torch.Tensor,
+                             clip_frames: int, sample_rate: int, fps: int) -> np.ndarray | None:
+        """Run the EchoMimic-v2 acc pipeline on a WAV clip. Returns (1,3,L,H,W) numpy or None."""
+        generator = torch.manual_seed(random.randint(0, 2**32 - 1))
+        result = self.echomimic(
+            self.reference_image,
+            wav_path,
+            poses_tensor[:, :, :clip_frames, ...],
+            self.video_width,
+            self.video_height,
+            clip_frames,
+            4,              # num_inference_steps (ACC)
+            1.0,            # guidance_scale
+            generator=generator,
+            audio_sample_rate=sample_rate,
+            context_frames=12,
+            fps=fps,
+            context_overlap=3,
+            start_idx=0,
+        )
+        video = result.videos  # (1, 3, L, H, W) tensor or numpy
+        if isinstance(video, torch.Tensor):
+            return video.cpu().numpy()
+        return video
+
+
+    async def handle_chat(self, request):
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+        clog = ColorizedLog.randomize()
+        peer = request.remote  # IP
+        peer_port = request.transport.get_extra_info("peername")[1]  # Port
+        clog.log("info", f"Incoming connection from {peer}:{peer_port}")
+
+        # self.lm_gen.temp = float(request.query["audio_temperature"])
+        # self.lm_gen.temp_text = float(request.query["text_temperature"])
+        # self.lm_gen.top_k_text = max(1, int(request.query["text_topk"]))
+        # self.lm_gen.top_k = max(1, int(request.query["audio_topk"]))
+        
+        # Construct full voice prompt path
+        requested_voice_prompt_path = None
+        voice_prompt_path = None
+        if self.voice_prompt_dir is not None:
+            voice_prompt_filename = request.query["voice_prompt"]
+            requested_voice_prompt_path = None
+            if voice_prompt_filename is not None:
+                requested_voice_prompt_path = os.path.join(self.voice_prompt_dir, voice_prompt_filename)
+            # If the voice prompt file does not exist, find a valid (s0) voiceprompt file in the directory
+            if requested_voice_prompt_path is None or not os.path.exists(requested_voice_prompt_path):
+                raise FileNotFoundError(
+                    f"Requested voice prompt '{voice_prompt_filename}' not found in '{self.voice_prompt_dir}'"
+                )
+            else:
+                voice_prompt_path = requested_voice_prompt_path
+                
+        if self.lm_gen.voice_prompt != voice_prompt_path:
+            if voice_prompt_path.endswith('.pt'):
+                # Load pre-saved voice prompt embeddings
+                self.lm_gen.load_voice_prompt_embeddings(voice_prompt_path)
+            else:
+                self.lm_gen.load_voice_prompt(voice_prompt_path)
+        self.lm_gen.text_prompt_tokens = self.text_tokenizer.encode(wrap_with_system_tags(request.query["text_prompt"])) if len(request.query["text_prompt"]) > 0 else None
+        seed = int(request["seed"]) if "seed" in request.query else None
+
+        async def recv_loop():
+            nonlocal close
+            try:
+                async for message in ws:
+                    if message.type == aiohttp.WSMsgType.ERROR:
+                        clog.log("error", f"{ws.exception()}")
+                        break
+                    elif message.type == aiohttp.WSMsgType.CLOSED:
+                        break
+                    elif message.type == aiohttp.WSMsgType.CLOSE:
+                        break
+                    elif message.type != aiohttp.WSMsgType.BINARY:
+                        clog.log("error", f"unexpected message type {message.type}")
+                        continue
+                    message = message.data
+                    if not isinstance(message, bytes):
+                        clog.log("error", f"unsupported message type {type(message)}")
+                        continue
+                    if len(message) == 0:
+                        clog.log("warning", "empty message")
+                        continue
+                    kind = message[0]
+                    if kind == 1:  # audio
+                        payload = message[1:]
+                        opus_reader.append_bytes(payload)
+                    else:
+                        clog.log("warning", f"unknown message kind {kind}")
+            finally:
+                close = True
+                clog.log("info", "connection closed")
+
+        # Queue for passing generated PCM to video generation
+        video_pcm_queue = asyncio.Queue(maxsize=100)
+        # Queue for passing encoded JPEG frames to the video send loop
+        video_frame_queue = asyncio.Queue(maxsize=200)
+
+        async def opus_loop():
+            all_pcm_data = None
+
+            while True:
+                if close:
+                    return
+                await asyncio.sleep(0.001)
+                pcm = opus_reader.read_pcm()
+                if pcm.shape[-1] == 0:
+                    continue
+                if all_pcm_data is None:
+                    all_pcm_data = pcm
+                else:
+                    all_pcm_data = np.concatenate((all_pcm_data, pcm))
+                while all_pcm_data.shape[-1] >= self.frame_size:
+                    be = time.time()
+                    chunk = all_pcm_data[: self.frame_size]
+                    all_pcm_data = all_pcm_data[self.frame_size:]
+                    chunk = torch.from_numpy(chunk)
+                    chunk = chunk.to(device=self.device)[None, None]
+                    codes = self.mimi.encode(chunk)
+                    _ = self.other_mimi.encode(chunk)
+                    for c in range(codes.shape[-1]):
+                        tokens = self.lm_gen.step(codes[:, :, c: c + 1])
+                        if tokens is None:
+                            continue
+                        assert tokens.shape[1] == self.lm_gen.lm_model.dep_q + 1
+                        main_pcm = self.mimi.decode(tokens[:, 1:9])
+                        _ = self.other_mimi.decode(tokens[:, 1:9])
+                        main_pcm = main_pcm.cpu()
+                        pcm_numpy = main_pcm[0, 0].numpy()
+                        opus_writer.append_pcm(pcm_numpy)
+                        # Queue PCM for video generation (non-blocking, drop if full)
+                        if self.echomimic is not None:
+                            try:
+                                video_pcm_queue.put_nowait(pcm_numpy.copy())
+                            except asyncio.QueueFull:
+                                pass  # Drop frame if video can't keep up
+                        text_token = tokens[0, 0, 0].item()
+                        if text_token not in (0, 3):
+                            _text = self.text_tokenizer.id_to_piece(text_token)  # type: ignore
+                            _text = _text.replace("▁", " ")
+                            msg = b"\x02" + bytes(_text, encoding="utf8")
+                            await ws.send_bytes(msg)
+                        else:
+                            text_token_map = ['EPAD', 'BOS', 'EOS', 'PAD']
+
+        async def video_loop():
+            """Generate video clips from accumulated PCM audio using EchoMimic-v2 acc.
+
+            The pipeline generates entire video clips (not individual frames):
+            1. Accumulate PCM audio for `video_clip_frames / video_fps` seconds
+            2. Save to a temp WAV, prepare pose tensor
+            3. Run the full diffusion pipeline (6 denoising steps)
+            4. Stream the resulting frames as JPEGs over WebSocket
+            """
+            if self.echomimic is None or self.reference_image is None:
+                return
+            if self._pose_files is None or len(self._pose_files) == 0:
+                clog.log("warning", "no pose files available, video_loop disabled")
+                return
+
+            CLIP_FRAMES = self.video_clip_frames
+            FPS = self.video_fps
+            SAMPLE_RATE = int(self.mimi.sample_rate)
+            samples_per_clip = int(SAMPLE_RATE * CLIP_FRAMES / FPS)
+            frame_interval = 1.0 / FPS
+            audio_buffer = np.array([], dtype=np.float32)
+            pose_idx = 0
+
+            while True:
+                if close:
+                    return
+                await asyncio.sleep(0.01)
+
+                # Drain queued PCM chunks into audio buffer
+                while not video_pcm_queue.empty():
+                    try:
+                        chunk = video_pcm_queue.get_nowait()
+                        audio_buffer = np.concatenate((audio_buffer, chunk))
+                    except asyncio.QueueEmpty:
+                        break
+
+                # Wait until we have enough audio for one clip
+                if len(audio_buffer) < samples_per_clip:
+                    continue
+
+                # Take one clip's worth of audio
+                clip_audio = audio_buffer[:samples_per_clip]
+                audio_buffer = audio_buffer[samples_per_clip:]
+                tmp_wav_path = None
+
+                try:
+                    # Save audio to temp WAV file (Whisper expects a file path)
+                    tmp_fd, tmp_wav_path = tempfile.mkstemp(suffix='.wav')
+                    os.close(tmp_fd)
+                    with wave.open(tmp_wav_path, 'wb') as wf:
+                        wf.setnchannels(1)
+                        wf.setsampwidth(2)  # 16-bit
+                        wf.setframerate(SAMPLE_RATE)
+                        pcm_int16 = np.clip(clip_audio * 32767, -32768, 32767).astype(np.int16)
+                        wf.writeframes(pcm_int16.tobytes())
+
+                    # Prepare pose tensor (cycle through available poses)
+                    poses_tensor = await asyncio.to_thread(
+                        self._prepare_pose_tensor, CLIP_FRAMES, pose_idx,
+                    )
+                    pose_idx = (pose_idx + CLIP_FRAMES) % len(self._pose_files)
+
+                    # Generate video clip in thread pool (diffusion is heavy)
+                    video_np = await asyncio.to_thread(
+                        self._generate_video_clip,
+                        tmp_wav_path, poses_tensor, CLIP_FRAMES, SAMPLE_RATE, FPS,
+                    )
+
+                    # Encode frames as JPEG and push to send queue
+                    if video_np is not None:
+                        num_frames = video_np.shape[2]
+                        for f_idx in range(num_frames):
+                            if close:
+                                return
+                            # video_np is (1, 3, L, H, W) in [0, 1]
+                            frame = video_np[0, :, f_idx, :, :]  # (3, H, W)
+                            frame = (frame * 255).clip(0, 255).astype(np.uint8)
+                            frame = frame.transpose(1, 2, 0)  # (H, W, 3) RGB
+                            frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+                            _, jpeg_bytes = cv2.imencode(
+                                '.jpg', frame_bgr,
+                                [cv2.IMWRITE_JPEG_QUALITY, 80],
+                            )
+                            try:
+                                video_frame_queue.put_nowait(jpeg_bytes.tobytes())
+                            except asyncio.QueueFull:
+                                pass  # Drop oldest frames if send can't keep up
+
+                except Exception as e:
+                    clog.log("warning", f"video clip generation failed: {e}")
+                finally:
+                    if tmp_wav_path is not None:
+                        try:
+                            os.unlink(tmp_wav_path)
+                        except OSError:
+                            pass
+
+        async def video_send_loop():
+            """Send queued JPEG frames over WebSocket at target FPS.
+
+            Decoupled from video_loop so diffusion can start generating the
+            next clip while previous frames are still being streamed."""
+            if self.echomimic is None or self.reference_image is None:
+                return
+            frame_interval = 1.0 / self.video_fps
+            while True:
+                if close:
+                    return
+                try:
+                    jpeg_bytes = await asyncio.wait_for(
+                        video_frame_queue.get(), timeout=0.1,
+                    )
+                except asyncio.TimeoutError:
+                    continue
+                await ws.send_bytes(b"\x03" + jpeg_bytes)
+                await asyncio.sleep(frame_interval)
+
+        async def send_loop():
+            while True:
+                if close:
+                    return
+                await asyncio.sleep(0.001)
+                msg = opus_writer.read_bytes()
+                if len(msg) > 0:
+                    await ws.send_bytes(b"\x01" + msg)
+
+        clog.log("info", "accepted connection")
+        if len(request.query["text_prompt"]) > 0:
+            clog.log("info", f"text prompt: {request.query['text_prompt']}")
+        if len(request.query["voice_prompt"]) > 0:
+            clog.log("info", f"voice prompt: {voice_prompt_path} (requested: {requested_voice_prompt_path})")
+        close = False
+        async with self.lock:
+            if seed is not None and seed != -1:
+                seed_all(seed)
+
+            opus_writer = sphn.OpusStreamWriter(self.mimi.sample_rate)
+            opus_reader = sphn.OpusStreamReader(self.mimi.sample_rate)
+            self.mimi.reset_streaming()
+            self.other_mimi.reset_streaming()
+            self.lm_gen.reset_streaming()
+            async def is_alive():
+                if close or ws.closed:
+                    return False
+                try:
+                    # Check for disconnect without waiting too long
+                    msg = await asyncio.wait_for(ws.receive(), timeout=0.01)
+                    if msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                        return False
+                except asyncio.TimeoutError:
+                    # No messages → client probably still alive
+                    return True
+                except aiohttp.ClientConnectionError:
+                    return False
+                return True
+            # Reuse mimi for encoding voice prompt and then reset it before conversation starts
+            await self.lm_gen.step_system_prompts_async(self.mimi, is_alive=is_alive)
+            self.mimi.reset_streaming()
+            clog.log("info", "done with system prompts")
+            # Send the handshake.
+            if await is_alive():
+                await ws.send_bytes(b"\x00")
+                clog.log("info", "sent handshake bytes")
+                # Clean cancellation manager
+                tasks = [
+                    asyncio.create_task(recv_loop()),
+                    asyncio.create_task(opus_loop()),
+                    asyncio.create_task(send_loop()),
+                    asyncio.create_task(video_loop()),
+                    asyncio.create_task(video_send_loop()),
+                ]
+
+                done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+                # Force-kill remaining tasks
+                for task in pending:
+                    task.cancel()
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
+                await ws.close()
+                clog.log("info", "session closed")
+                # await asyncio.gather(opus_loop(), recv_loop(), send_loop())
+        clog.log("info", "done with connection")
+        return ws
+
+
+def _get_voice_prompt_dir(voice_prompt_dir: Optional[str], hf_repo: str) -> Optional[str]:
+    """
+    If voice_prompt_dir is None:
+      - download voices.tgz from HF
+      - extract it once
+      - return extracted directory
+    If voice_prompt_dir is provided:
+      - just return it
+    """
+    if voice_prompt_dir is not None:
+        return voice_prompt_dir
+
+    logger.info("retrieving voice prompts")
+
+    voices_tgz = hf_hub_download(hf_repo, "voices.tgz")
+    voices_tgz = Path(voices_tgz)
+    voices_dir = voices_tgz.parent / "voices"
+
+    if not voices_dir.exists():
+        logger.info(f"extracting {voices_tgz} to {voices_dir}")
+        with tarfile.open(voices_tgz, "r:gz") as tar:
+            tar.extractall(path=voices_tgz.parent)
+
+    if not voices_dir.exists():
+        raise RuntimeError("voices.tgz did not contain a 'voices/' directory")
+
+    return str(voices_dir)
+
+
+def _get_static_path(static: Optional[str]) -> Optional[str]:
+    if static is None:
+        logger.info("retrieving the static content")
+        dist_tgz = hf_hub_download("nvidia/personaplex-7b-v1", "dist.tgz")
+        dist_tgz = Path(dist_tgz)
+        dist = dist_tgz.parent / "dist"
+        if not dist.exists():
+            with tarfile.open(dist_tgz, "r:gz") as tar:
+                tar.extractall(path=dist_tgz.parent)
+        return str(dist)
+    elif static != "none":
+        # When set to the "none" string, we don't serve any static content.
+        return static
+    return None
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--host", default="localhost", type=str)
+    parser.add_argument("--port", default=8998, type=int)
+    parser.add_argument("--static", type=str)
+    parser.add_argument("--gradio-tunnel", action='store_true', help='Activate a gradio tunnel.')
+    parser.add_argument("--gradio-tunnel-token",
+                        help='Provide a custom (secret) token here to keep getting the same URL.')
+
+    parser.add_argument("--tokenizer", type=str, help="Path to a local tokenizer file.")
+    parser.add_argument("--moshi-weight", type=str, help="Path to a local checkpoint file for Moshi.")
+    parser.add_argument("--mimi-weight", type=str, help="Path to a local checkpoint file for Mimi.")
+    parser.add_argument("--hf-repo", type=str, default=loaders.DEFAULT_REPO,
+                        help="HF repo to look into, defaults PersonaPlex. "
+                             "Use this to select a different pre-trained model.")
+    parser.add_argument("--device", type=str, default="cuda", help="Device on which to run, defaults to 'cuda'.")
+    parser.add_argument("--cpu-offload", action="store_true",
+                        help="Offload LM model layers to CPU when GPU memory is insufficient. "
+                             "Requires 'accelerate' package.")
+    parser.add_argument(
+        "--voice-prompt-dir",
+        type=str,
+        help=(
+            "Directory containing voice prompt files. "
+            "If omitted, voices.tgz is downloaded from HF and extracted."
+            "Voice prompt filenames from client requests will be joined with this directory path."
+        )
+    )
+    parser.add_argument(
+        "--ssl",
+        type=str,
+        help=(
+            "use https instead of http, this flag should point to a directory "
+            "that contains valid key.pem and cert.pem files"
+        )
+    )
+    parser.add_argument(
+        "--enable-video",
+        action="store_true",
+        help="Enable EchoMimic-v2 acc video generation (requires ~10-12GB extra VRAM)."
+    )
+    parser.add_argument(
+        "--echomimic-dir",
+        type=str,
+        help="Path to the echomimic_v2 root directory (contains pretrained_weights/, configs/, src/)."
+    )
+    parser.add_argument(
+        "--reference-image",
+        type=str,
+        help="Path to reference face image for EchoMimic-v2 video generation."
+    )
+    parser.add_argument(
+        "--pose-dir",
+        type=str,
+        help="Path to directory containing pose .npy files (e.g. echomimic_v2/assets/halfbody_demo/pose/01)."
+    )
+    parser.add_argument("--video-width", type=int, default=512, help="Video frame width (default: 512).")
+    parser.add_argument("--video-height", type=int, default=512, help="Video frame height (default: 512).")
+    parser.add_argument("--video-fps", type=int, default=24, help="Video FPS (default: 24).")
+    parser.add_argument(
+        "--video-clip-frames",
+        type=int,
+        default=12,
+        help="Frames per video clip (default: 12 = 0.5 second at 24fps). Lower = less latency, higher = smoother."
+    )
+
+    args = parser.parse_args()
+    args.voice_prompt_dir = _get_voice_prompt_dir(
+        args.voice_prompt_dir,
+        args.hf_repo,
+    )
+    if args.voice_prompt_dir is not None:
+        assert os.path.exists(args.voice_prompt_dir), \
+            f"Directory missing: {args.voice_prompt_dir}"
+    logger.info(f"voice_prompt_dir = {args.voice_prompt_dir}")
+
+    static_path: None | str = _get_static_path(args.static)
+    assert static_path is None or os.path.exists(static_path), \
+        f"Static path does not exist: {static_path}."
+    logger.info(f"static_path = {static_path}")
+    args.device = torch_auto_device(args.device)
+
+    seed_all(42424242)
+
+    setup_tunnel = None
+    tunnel_token = ''
+    if args.gradio_tunnel:
+        try:
+            from gradio import networking  # type: ignore
+        except ImportError:
+            logger.error("Cannot find gradio which is required to activate a tunnel. "
+                         "Please install with `pip install gradio`.")
+            sys.exit(1)
+        setup_tunnel = networking.setup_tunnel
+        if args.gradio_tunnel_token is None:
+            tunnel_token = secrets.token_urlsafe(32)
+        else:
+            tunnel_token = args.gradio_tunnel_token
+
+    # Download config.json to increment download counter
+    # No worries about double-counting since config.json will be cached the second time
+    hf_hub_download(args.hf_repo, "config.json")
+
+    logger.info("loading mimi")
+    if args.mimi_weight is None:
+        args.mimi_weight = hf_hub_download(args.hf_repo, loaders.MIMI_NAME)
+    mimi = loaders.get_mimi(args.mimi_weight, args.device)
+    other_mimi = loaders.get_mimi(args.mimi_weight, args.device)
+    logger.info("mimi loaded")
+
+    if args.tokenizer is None:
+        args.tokenizer = hf_hub_download(args.hf_repo, loaders.TEXT_TOKENIZER_NAME)
+    text_tokenizer = sentencepiece.SentencePieceProcessor(args.tokenizer)  # type: ignore
+
+    logger.info("loading moshi")
+    if args.moshi_weight is None:
+        args.moshi_weight = hf_hub_download(args.hf_repo, loaders.MOSHI_NAME)
+    lm = loaders.get_moshi_lm(args.moshi_weight, device=args.device, cpu_offload=args.cpu_offload)
+    lm.eval()
+    logger.info("moshi loaded")
+    state = ServerState(
+        mimi=mimi,
+        other_mimi=other_mimi,
+        text_tokenizer=text_tokenizer,
+        lm=lm,
+        device=args.device,
+        voice_prompt_dir=args.voice_prompt_dir,
+        save_voice_prompt_embeddings=False,
+        enable_video=args.enable_video,
+        reference_image_path=args.reference_image,
+        echomimic_dir=getattr(args, 'echomimic_dir', None),
+        pose_dir=getattr(args, 'pose_dir', None),
+        video_width=getattr(args, 'video_width', 512),
+        video_height=getattr(args, 'video_height', 512),
+        video_fps=getattr(args, 'video_fps', 24),
+        video_clip_frames=getattr(args, 'video_clip_frames', 12),
+    )
+    logger.info("warming up the model")
+    state.warmup()
+    app = web.Application()
+    app.router.add_get("/api/chat", state.handle_chat)
+    if static_path is not None:
+        async def handle_root(_):
+            return web.FileResponse(os.path.join(static_path, "index.html"))
+
+        logger.info(f"serving static content from {static_path}")
+        app.router.add_get("/", handle_root)
+        app.router.add_static(
+            "/", path=static_path, follow_symlinks=True, name="static"
+        )
+    protocol = "http"
+    ssl_context = None
+    if args.ssl is not None:
+        ssl_context, protocol = create_ssl_context(args.ssl)
+    host_ip = args.host if args.host not in ("0.0.0.0", "::", "localhost") else get_lan_ip()
+    logger.info(f"Access the Web UI directly at {protocol}://{host_ip}:{args.port}")
+    if setup_tunnel is not None:
+        tunnel = setup_tunnel('localhost', args.port, tunnel_token, None)
+        logger.info(f"Tunnel started, if executing on a remote GPU, you can use {tunnel}.")
+    web.run_app(app, port=args.port, ssl_context=ssl_context)
+
+
+with torch.no_grad():
+    main()

@@ -1,0 +1,49 @@
+[project]
+name = "web-app"
+version = "0.1.0"
+description = "EchoMimic-v2 web app – browser audio → diffusion pipeline → browser video+audio"
+requires-python = "==3.11.9"
+dependencies = [
+    "aiohttp>=3.9",
+    "opencv-python-headless>=4.8",
+    "torch>=2.0",
+    "diffusers==0.31.0",
+    "omegaconf==2.3.0",
+    "numpy==1.26.4",
+    "Pillow>=10.2.0,<10.3.0",
+    "transformers>=4.46.3,<5",
+    "accelerate==1.1.1",
+    "einops==0.8.0",
+    "ffmpeg-python",
+    "soundfile",
+    "matplotlib",
+    "tqdm",
+    "safetensors",
+    "nvidia-cublas-cu12 ; sys_platform == 'win32'",
+    "nvidia-cudnn-cu12 ; sys_platform == 'win32'",
+]
+
+[project.optional-dependencies]
+blackwell = []
+
+[project.scripts]
+web-app = "web_app.app:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.uv]
+package = true
+environments = [
+    "sys_platform == 'win32'",
+    "sys_platform == 'linux'",
+]
+
+[[tool.uv.index]]
+name = "pytorch-gpu"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-gpu" }

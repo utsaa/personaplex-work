@@ -1,0 +1,111 @@
+<!DOCTYPE html>
+<html>
+<head>
+<title>EchoMimic-v2 Live</title>
+<style>
+  body { background:#111; color:#eee; font-family:sans-serif;
+         text-align:center; margin:2em; }
+  #video { max-width:512px; border:2px solid #333; background:#000; }
+  button { padding:10px 24px; font-size:16px; margin:10px; cursor:pointer; }
+  #status { color:#888; margin:10px; font-size:14px; }
+</style>
+</head>
+<body>
+<h2>EchoMimic-v2 Live</h2>
+<div><img id="video" width="512" height="512" /></div>
+<div>
+  <button id="startBtn" onclick="start()">Start</button>
+  <button id="stopBtn" onclick="stop()" disabled>Stop</button>
+</div>
+<div id="status">Click Start to begin.</div>
+<script>
+let ws, micCtx, source, processor, stream, playCtx, playNextTime;
+
+function setStatus(msg) {
+  document.getElementById('status').textContent = msg;
+}
+
+async function start() {
+  setStatus('Connecting...');
+  ws = new WebSocket('ws://' + location.host + '/ws');
+  ws.binaryType = 'arraybuffer';
+
+  ws.onopen = async () => {
+    setStatus('Connected. Requesting mic...');
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      micCtx = new AudioContext({ sampleRate: 16000 });
+      source = micCtx.createMediaStreamSource(stream);
+      processor = micCtx.createScriptProcessor(2048, 1, 1);
+      processor.onaudioprocess = (e) => {
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          const pcm = e.inputBuffer.getChannelData(0);
+          ws.send(new Float32Array(pcm).buffer);
+        }
+      };
+      source.connect(processor);
+      processor.connect(micCtx.destination);
+
+      // Playback context for returned audio (16 kHz)
+      playCtx = new AudioContext({ sampleRate: 16000 });
+      playNextTime = 0;
+
+      document.getElementById('startBtn').disabled = true;
+      document.getElementById('stopBtn').disabled = false;
+      setStatus('Streaming audio \u2192 generating video...');
+    } catch (err) {
+      setStatus('Mic error: ' + err.message);
+    }
+  };
+
+  ws.onmessage = (e) => {
+    if (!(e.data instanceof ArrayBuffer) || e.data.byteLength < 2) return;
+    const view = new Uint8Array(e.data);
+    const tag = view[0];
+    const payload = e.data.slice(1);
+
+    if (tag === 0x01) {
+      // JPEG video frame
+      const blob = new Blob([payload], { type: 'image/jpeg' });
+      const url = URL.createObjectURL(blob);
+      const img = document.getElementById('video');
+      const old = img.src;
+      img.src = url;
+      if (old && old.startsWith('blob:')) URL.revokeObjectURL(old);
+    } else if (tag === 0x02 && playCtx) {
+      // float32 PCM audio chunk — schedule for gapless playback
+      const f32 = new Float32Array(payload);
+      const buf = playCtx.createBuffer(1, f32.length, 16000);
+      buf.getChannelData(0).set(f32);
+      const src = playCtx.createBufferSource();
+      src.buffer = buf;
+      src.connect(playCtx.destination);
+      const now = playCtx.currentTime;
+      if (playNextTime < now) playNextTime = now;
+      src.start(playNextTime);
+      playNextTime += buf.duration;
+    }
+  };
+
+  ws.onclose = () => { setStatus('Disconnected.'); cleanup(); };
+  ws.onerror = () => { setStatus('WebSocket error.'); cleanup(); };
+}
+
+function stop() {
+  if (ws) ws.close();
+  cleanup();
+}
+
+function cleanup() {
+  if (processor) { processor.disconnect(); processor = null; }
+  if (source) { source.disconnect(); source = null; }
+  if (micCtx) { micCtx.close(); micCtx = null; }
+  if (playCtx) { playCtx.close(); playCtx = null; }
+  if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
+  playNextTime = 0;
+  document.getElementById('startBtn').disabled = false;
+  document.getElementById('stopBtn').disabled = true;
+}
+</script>
+</body>
+</html>
