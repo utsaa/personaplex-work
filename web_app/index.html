@@ -39,7 +39,8 @@ function setStatus(msg) {
 
 async function start() {
   setStatus('Connecting...');
-  ws = new WebSocket('ws://' + location.host + '/ws');
+  const wsProto = location.protocol === 'https:' ? 'wss://' : 'ws://';
+  ws = new WebSocket(wsProto + location.host + '/ws');
   ws.binaryType = 'arraybuffer';
 
   ws.onopen = async () => {
