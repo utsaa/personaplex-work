@@ -491,7 +491,7 @@ def video_generation_thread(
                 
                 # Speech detected
                 if consecutive_silent_clips > 0:
-                     print(f"[GEN] Audio detected. Starting...")
+                     print(f"[GEN] Audio detected (RMS={clip_rms:.4f}). Starting...")
                 consecutive_silent_clips = 0
                 
                 # Prepare Inputs Synchronously (Fallback)
@@ -688,8 +688,62 @@ def postprocess_thread(
 
 
 # ---------------------------------------------------------------------------
-# Web server
+# Warmup
 # ---------------------------------------------------------------------------
+
+def warmup_pipeline(pipe, ref_image, pose_dir, pose_files, args, reference_cache):
+    print("[INIT] Running warmup inference to trigger compilation...")
+    print("[INIT] This ensures the first user interaction is fast.")
+    
+    # Create dummy WAV
+    tmp_fd, dummy_wav = tempfile.mkstemp(suffix=".wav")
+    os.close(tmp_fd)
+    
+    try:
+        # Write 1s silent audio
+        with wave.open(dummy_wav, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(args.sample_rate)
+            # 1s of audio is enough for a clip
+            data = np.zeros(args.sample_rate, dtype=np.int16)
+            wf.writeframes(data.tobytes())
+            
+        # Prepare dummy pose (using real files)
+        # We use the first one
+        poses_tensor = prepare_pose_tensor(
+            pose_dir, pose_files, args.clip_frames, 0, args.width, args.height,
+            device=DEVICE, dtype=WEIGHT_DTYPE,
+        )
+        
+        # Generator
+        generator = torch.manual_seed(0)
+        
+        # Run pipeline
+        with torch.no_grad():
+             pipe(
+                ref_image, dummy_wav,
+                poses_tensor[:, :, :args.clip_frames, ...],
+                args.width, args.height, args.clip_frames, args.steps, args.cfg,
+                generator=generator,
+                audio_sample_rate=args.sample_rate,
+                context_frames=12, fps=args.fps,
+                context_overlap=3, start_idx=0,
+                audio_margin=args.audio_margin, 
+                init_latents=None,
+                reference_cache=reference_cache,
+                audio_context_frames=0, 
+            )
+        print("[INIT] Warmup complete. Compilation finished.")
+        
+    except Exception as e:
+        print(f"[WARN] Warmup failed: {e}")
+        import traceback
+        traceback.print_exc()
+    finally:
+        if os.path.exists(dummy_wav):
+            os.unlink(dummy_wav)
+
 
 async def run_server(pipe, ref_image, pose_dir, pose_files, args):
     from aiohttp import web
@@ -701,6 +755,11 @@ async def run_server(pipe, ref_image, pose_dir, pose_files, args):
         dtype=pipe.dtype, device=pipe.device
     )
     print(f"[INIT] Reference cached.")
+
+    if args.compile_unet:
+        # Run warmup while we have context
+        # This will block the event loop for ~30-60s, which is fine during startup
+        warmup_pipeline(pipe, ref_image, pose_dir, pose_files, args, reference_cache)
 
     audio_queue = queue.Queue()
     raw_clip_queue = queue.Queue(maxsize=4)
@@ -843,7 +902,7 @@ def main():
     parser.add_argument("--steps", type=int, default=6)
     parser.add_argument("--cfg", type=float, default=1.0)
     parser.add_argument("--port", type=int, default=8080)
-    parser.add_argument("--vad-threshold", type=float, default=0.005,
+    parser.add_argument("--vad-threshold", type=float, default=0.015,
                         help="Server-side RMS silence threshold (0.0 = disabled). "
                              "Clips below this are discarded.")
     parser.add_argument("--use-init-latent", action=argparse.BooleanOptionalAction, default=True,

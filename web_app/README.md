@@ -37,7 +37,9 @@ parent_dir/
 ├── echomimic_v2/      # pipeline code + pretrained_weights/
 └── web_app/           # this package
     ├── app.py
-    └── ...
+    ├── index.html
+    ├── pyproject.toml
+    └── README.md
 ```
 
 ## Setup
@@ -60,8 +62,7 @@ pip install -e .
 
 ```bash
 # Using uv (from parent directory)
-uv run --directory web_app python -m web_app.app \
-    --port 8080 \
+uv run --directory web_app python app.py --port 8080 \
     --audio-margin 6 \
     --use-init-latent \
     --compile-unet
@@ -122,8 +123,14 @@ The web app includes several advanced optimizations for low-latency, real-time p
 | `--sample-rate` | `16000` | Audio sample rate (Hz) |
 | `--fps` | `24` | Output video FPS |
 | `--clip-frames` | `12` | Frames per generation clip |
+| `--width` | `512` | Output width |
+| `--height` | `512` | Output height |
 | `--steps` | `6` | Denoising steps |
 | `--cfg` | `1.0` | Classifier-free guidance scale |
+| `--port` | `8080` | HTTP server port |
+| `--vad-threshold` | `0.005` | Server-side silence threshold (RMS). Clips below this are discarded. Set to `0.0` to disable. |
+| `--use-init-latent` | `True` | **Enable latent state preservation** for smooth pose continuity between clips |
+| `--audio-margin` | `2` | Audio feature context margin (frames). |
 
 ## Development
 

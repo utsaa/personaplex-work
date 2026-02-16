@@ -130,7 +130,7 @@
     }
 
     // Client-side Voice Activity Detection (RMS threshold)
-    const VAD_RMS_THRESHOLD = 0.008;   // ~-42 dBFS – adjust if needed
+    const VAD_RMS_THRESHOLD = 0.015;   // Increased to avoid noise
     const VAD_HOLD_CHUNKS = 6;       // keep sending for N chunks after speech stops
     let vadHoldCounter = 0;
 
