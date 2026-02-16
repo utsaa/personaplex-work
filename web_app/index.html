@@ -1,140 +1,265 @@
 <!DOCTYPE html>
 <html>
+
 <head>
-<title>EchoMimic-v2 Live</title>
-<style>
-  body { background:#111; color:#eee; font-family:sans-serif;
-         text-align:center; margin:2em; }
-  #video { max-width:512px; border:2px solid #333; background:#000; }
-  button { padding:10px 24px; font-size:16px; margin:10px; cursor:pointer; }
-  #status { color:#888; margin:10px; font-size:14px; }
-</style>
+  <title>EchoMimic-v2 Live</title>
+  <style>
+    body {
+      background: #111;
+      color: #eee;
+      font-family: sans-serif;
+      text-align: center;
+      margin: 2em;
+    }
+
+    #video {
+      border: 2px solid #333;
+      background: #000;
+    }
+
+    button {
+      padding: 10px 24px;
+      font-size: 16px;
+      margin: 10px;
+      cursor: pointer;
+    }
+
+    #status {
+      color: #888;
+      margin: 10px;
+      font-size: 14px;
+    }
+
+    #buffer-gauge {
+      font-size: 12px;
+      color: #888;
+      margin: 4px;
+    }
+
+    #buffer-bar-container {
+      display: inline-block;
+      width: 200px;
+      height: 10px;
+      background: #333;
+      border-radius: 5px;
+      overflow: hidden;
+      vertical-align: middle;
+    }
+
+    #buffer-bar {
+      height: 100%;
+      width: 0%;
+      background: #0a0;
+      transition: width 0.15s;
+    }
+  </style>
 </head>
+
 <body>
-<h2>EchoMimic-v2 Live</h2>
-<div><img id="video" width="512" height="512" /></div>
-<div>
-  <button id="startBtn" onclick="start()">Start</button>
-  <button id="stopBtn" onclick="stop()" disabled>Stop</button>
-</div>
-<div id="status">Click Start to begin.</div>
-<div id="vad-indicator" style="font-size:12px;color:#555;margin:4px;">VAD: idle</div>
-<script>
-let ws, micCtx, source, processor, stream, playCtx, playNextTime;
+  <h2>EchoMimic-v2 Live</h2>
+  <div><img id="video" /></div>
+  <div>
+    <button id="startBtn" onclick="start()">Start</button>
+    <button id="stopBtn" onclick="stop()" disabled>Stop</button>
+  </div>
+  <div id="status">Click Start to begin.</div>
+  <div id="vad-indicator" style="font-size:12px;color:#555;margin:4px;">VAD: idle</div>
+  <div id="buffer-gauge">
+    Buffer: <span id="buffer-count">0</span> frames
+    <div id="buffer-bar-container">
+      <div id="buffer-bar"></div>
+    </div>
+  </div>
+  <script>
+    // ---------------------------------------------------------------------------
+    // Configuration — change these to match --width / --height in app.py
+    // ---------------------------------------------------------------------------
+    const VIDEO_W = 512;
+    const VIDEO_H = 512;
 
-// Client-side Voice Activity Detection (RMS threshold)
-const VAD_RMS_THRESHOLD = 0.008;   // ~-42 dBFS – adjust if needed
-const VAD_HOLD_CHUNKS   = 6;       // keep sending for N chunks after speech stops
-let vadHoldCounter = 0;
+    let ws, micCtx, source, processor, stream, playCtx, playNextTime;
 
-function computeRMS(pcm) {
-  let sum = 0;
-  for (let i = 0; i < pcm.length; i++) sum += pcm[i] * pcm[i];
-  return Math.sqrt(sum / pcm.length);
-}
+    // Apply dimensions to the video element on load
+    (function () {
+      const img = document.getElementById('video');
+      img.width = VIDEO_W;
+      img.height = VIDEO_H;
+      img.style.maxWidth = VIDEO_W + 'px';
+    })();
 
-function setStatus(msg) {
-  document.getElementById('status').textContent = msg;
-}
+    // ---------------------------------------------------------------------------
+    // Frame buffer: accumulate frames and play back at a steady FPS
+    // ---------------------------------------------------------------------------
+    const TARGET_FPS = 24;
+    const MIN_BUFFER = 12;        // start playback after this many frames buffered
+    const MAX_BUFFER = 200;       // discard oldest if buffer grows beyond this
+    let frameBuffer = [];         // array of blob URLs (JPEG)
+    let playbackTimer = null;     // setInterval id
+    let playbackStarted = false;
 
-async function start() {
-  setStatus('Connecting...');
-  const wsProto = location.protocol === 'https:' ? 'wss://' : 'ws://';
-  ws = new WebSocket(wsProto + location.host + '/ws');
-  ws.binaryType = 'arraybuffer';
+    function startPlayback() {
+      if (playbackTimer) return;
+      playbackStarted = true;
+      const interval = 1000 / TARGET_FPS;
+      playbackTimer = setInterval(() => {
+        if (frameBuffer.length === 0) {
+          // Buffer underrun — pause and wait for re-buffer
+          stopPlayback();
+          playbackStarted = false;
+          setStatus('Buffering...');
+          return;
+        }
+        const url = frameBuffer.shift();
+        const img = document.getElementById('video');
+        const old = img.src;
+        img.src = url;
+        if (old && old.startsWith('blob:')) URL.revokeObjectURL(old);
+        updateBufferGauge();
+      }, interval);
+    }
 
-  ws.onopen = async () => {
-    setStatus('Connected. Requesting mic...');
-    try {
-      stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      micCtx = new AudioContext({ sampleRate: 16000 });
-      source = micCtx.createMediaStreamSource(stream);
-      processor = micCtx.createScriptProcessor(2048, 1, 1);
-      processor.onaudioprocess = (e) => {
-        if (ws && ws.readyState === WebSocket.OPEN) {
-          const pcm = e.inputBuffer.getChannelData(0);
-          const rms = computeRMS(pcm);
-          const indicator = document.getElementById('vad-indicator');
+    function stopPlayback() {
+      if (playbackTimer) { clearInterval(playbackTimer); playbackTimer = null; }
+    }
 
-          if (rms >= VAD_RMS_THRESHOLD) {
-            // Speech detected – send and reset hold counter
-            vadHoldCounter = VAD_HOLD_CHUNKS;
-            ws.send(new Float32Array(pcm).buffer);
-            if (indicator) { indicator.textContent = 'VAD: speaking \u{1F50A}'; indicator.style.color = '#0f0'; }
-          } else if (vadHoldCounter > 0) {
-            // Tail – keep sending briefly after speech ends
-            vadHoldCounter--;
-            ws.send(new Float32Array(pcm).buffer);
-            if (indicator) { indicator.textContent = 'VAD: tail...'; indicator.style.color = '#aa0'; }
-          } else {
-            // Silence – do NOT send
-            if (indicator) { indicator.textContent = 'VAD: silent'; indicator.style.color = '#555'; }
-          }
+    function updateBufferGauge() {
+      const el = document.getElementById('buffer-count');
+      const bar = document.getElementById('buffer-bar');
+      if (el) el.textContent = frameBuffer.length;
+      if (bar) bar.style.width = Math.min(100, (frameBuffer.length / MIN_BUFFER) * 100) + '%';
+    }
+
+    // Client-side Voice Activity Detection (RMS threshold)
+    const VAD_RMS_THRESHOLD = 0.008;   // ~-42 dBFS – adjust if needed
+    const VAD_HOLD_CHUNKS = 6;       // keep sending for N chunks after speech stops
+    let vadHoldCounter = 0;
+
+    function computeRMS(pcm) {
+      let sum = 0;
+      for (let i = 0; i < pcm.length; i++) sum += pcm[i] * pcm[i];
+      return Math.sqrt(sum / pcm.length);
+    }
+
+    function setStatus(msg) {
+      document.getElementById('status').textContent = msg;
+    }
+
+    async function start() {
+      setStatus('Connecting...');
+      const wsProto = location.protocol === 'https:' ? 'wss://' : 'ws://';
+      ws = new WebSocket(wsProto + location.host + '/ws');
+      ws.binaryType = 'arraybuffer';
+
+      ws.onopen = async () => {
+        setStatus('Connected. Requesting mic...');
+        try {
+          stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+          micCtx = new AudioContext({ sampleRate: 16000 });
+          source = micCtx.createMediaStreamSource(stream);
+          processor = micCtx.createScriptProcessor(2048, 1, 1);
+          processor.onaudioprocess = (e) => {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+              const pcm = e.inputBuffer.getChannelData(0);
+              const rms = computeRMS(pcm);
+              const indicator = document.getElementById('vad-indicator');
+
+              if (rms >= VAD_RMS_THRESHOLD) {
+                // Speech detected – send and reset hold counter
+                vadHoldCounter = VAD_HOLD_CHUNKS;
+                ws.send(new Float32Array(pcm).buffer);
+                if (indicator) { indicator.textContent = 'VAD: speaking \u{1F50A}'; indicator.style.color = '#0f0'; }
+              } else if (vadHoldCounter > 0) {
+                // Tail – keep sending briefly after speech ends
+                vadHoldCounter--;
+                ws.send(new Float32Array(pcm).buffer);
+                if (indicator) { indicator.textContent = 'VAD: tail...'; indicator.style.color = '#aa0'; }
+              } else {
+                // Silence – do NOT send
+                if (indicator) { indicator.textContent = 'VAD: silent'; indicator.style.color = '#555'; }
+              }
+            }
+          };
+          source.connect(processor);
+          processor.connect(micCtx.destination);
+
+          // Playback context for returned audio (16 kHz)
+          playCtx = new AudioContext({ sampleRate: 16000 });
+          playNextTime = 0;
+
+          document.getElementById('startBtn').disabled = true;
+          document.getElementById('stopBtn').disabled = false;
+          setStatus('Buffering...');
+        } catch (err) {
+          setStatus('Mic error: ' + err.message);
         }
       };
-      source.connect(processor);
-      processor.connect(micCtx.destination);
 
-      // Playback context for returned audio (16 kHz)
-      playCtx = new AudioContext({ sampleRate: 16000 });
+      ws.onmessage = (e) => {
+        if (!(e.data instanceof ArrayBuffer) || e.data.byteLength < 2) return;
+        const view = new Uint8Array(e.data);
+        const tag = view[0];
+        const payload = e.data.slice(1);
+
+        if (tag === 0x01) {
+          // JPEG video frame → push to buffer
+          const blob = new Blob([payload], { type: 'image/jpeg' });
+          const url = URL.createObjectURL(blob);
+
+          // Cap the buffer to avoid unbounded memory growth
+          if (frameBuffer.length >= MAX_BUFFER) {
+            const discarded = frameBuffer.shift();
+            URL.revokeObjectURL(discarded);
+          }
+          frameBuffer.push(url);
+          updateBufferGauge();
+
+          // Start playback once we have enough frames
+          if (!playbackStarted && frameBuffer.length >= MIN_BUFFER) {
+            setStatus('Playing...');
+            startPlayback();
+          }
+        } else if (tag === 0x02 && playCtx) {
+          // float32 PCM audio chunk — schedule for gapless playback
+          const f32 = new Float32Array(payload);
+          const buf = playCtx.createBuffer(1, f32.length, 16000);
+          buf.getChannelData(0).set(f32);
+          const src = playCtx.createBufferSource();
+          src.buffer = buf;
+          src.connect(playCtx.destination);
+          const now = playCtx.currentTime;
+          if (playNextTime < now) playNextTime = now;
+          src.start(playNextTime);
+          playNextTime += buf.duration;
+        }
+      };
+
+      ws.onclose = () => { setStatus('Disconnected.'); cleanup(); };
+      ws.onerror = () => { setStatus('WebSocket error.'); cleanup(); };
+    }
+
+    function stop() {
+      if (ws) ws.close();
+      cleanup();
+    }
+
+    function cleanup() {
+      stopPlayback();
+      playbackStarted = false;
+      // Release any remaining buffered blob URLs
+      for (const url of frameBuffer) URL.revokeObjectURL(url);
+      frameBuffer = [];
+      updateBufferGauge();
+      if (processor) { processor.disconnect(); processor = null; }
+      if (source) { source.disconnect(); source = null; }
+      if (micCtx) { micCtx.close(); micCtx = null; }
+      if (playCtx) { playCtx.close(); playCtx = null; }
+      if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
       playNextTime = 0;
-
-      document.getElementById('startBtn').disabled = true;
-      document.getElementById('stopBtn').disabled = false;
-      setStatus('Streaming audio \u2192 generating video...');
-    } catch (err) {
-      setStatus('Mic error: ' + err.message);
+      vadHoldCounter = 0;
+      document.getElementById('startBtn').disabled = false;
+      document.getElementById('stopBtn').disabled = true;
     }
-  };
-
-  ws.onmessage = (e) => {
-    if (!(e.data instanceof ArrayBuffer) || e.data.byteLength < 2) return;
-    const view = new Uint8Array(e.data);
-    const tag = view[0];
-    const payload = e.data.slice(1);
-
-    if (tag === 0x01) {
-      // JPEG video frame
-      const blob = new Blob([payload], { type: 'image/jpeg' });
-      const url = URL.createObjectURL(blob);
-      const img = document.getElementById('video');
-      const old = img.src;
-      img.src = url;
-      if (old && old.startsWith('blob:')) URL.revokeObjectURL(old);
-    } else if (tag === 0x02 && playCtx) {
-      // float32 PCM audio chunk — schedule for gapless playback
-      const f32 = new Float32Array(payload);
-      const buf = playCtx.createBuffer(1, f32.length, 16000);
-      buf.getChannelData(0).set(f32);
-      const src = playCtx.createBufferSource();
-      src.buffer = buf;
-      src.connect(playCtx.destination);
-      const now = playCtx.currentTime;
-      if (playNextTime < now) playNextTime = now;
-      src.start(playNextTime);
-      playNextTime += buf.duration;
-    }
-  };
-
-  ws.onclose = () => { setStatus('Disconnected.'); cleanup(); };
-  ws.onerror = () => { setStatus('WebSocket error.'); cleanup(); };
-}
-
-function stop() {
-  if (ws) ws.close();
-  cleanup();
-}
-
-function cleanup() {
-  if (processor) { processor.disconnect(); processor = null; }
-  if (source) { source.disconnect(); source = null; }
-  if (micCtx) { micCtx.close(); micCtx = null; }
-  if (playCtx) { playCtx.close(); playCtx = null; }
-  if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
-  playNextTime = 0;
-  document.getElementById('startBtn').disabled = false;
-  document.getElementById('stopBtn').disabled = true;
-}
-</script>
+  </script>
 </body>
+
 </html>

@@ -15,6 +15,7 @@ Architecture:
 
 import argparse
 import asyncio
+from datetime import datetime
 import os
 import queue
 import random
@@ -53,9 +54,57 @@ CONFIG_PATH = os.path.join(_ECHOMIMIC_DIR, "configs", "prompts", "infer_acc.yaml
 DEFAULT_REF_IMAGE = os.path.join(_ECHOMIMIC_DIR, "assets", "therapist_ref.png")
 DEFAULT_POSE_DIR = os.path.join(_ECHOMIMIC_DIR, "assets", "halfbody_demo", "pose", "01")
 INDEX_HTML_PATH = os.path.join(_HERE, "index.html")
+LOGS_DIR = os.path.join(_HERE, "logs")
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 WEIGHT_DTYPE = torch.float16
+
+
+# ---------------------------------------------------------------------------
+# Run-log: tee stdout/stderr to a file inside web_app/logs/
+# ---------------------------------------------------------------------------
+
+class TeeStream:
+    """Write to both the original stream and a log file simultaneously."""
+
+    def __init__(self, original_stream, log_file):
+        self._original = original_stream
+        self._log = log_file
+
+    def write(self, data):
+        self._original.write(data)
+        self._original.flush()
+        try:
+            self._log.write(data)
+            self._log.flush()
+        except Exception:
+            pass
+
+    def flush(self):
+        self._original.flush()
+        try:
+            self._log.flush()
+        except Exception:
+            pass
+
+    # Forward everything else (fileno, isatty, etc.) to the original stream
+    def __getattr__(self, name):
+        return getattr(self._original, name)
+
+
+def setup_logging() -> str:
+    """Create logs/ dir and redirect stdout+stderr to a timestamped run log.
+
+    Returns the path to the log file.
+    """
+    os.makedirs(LOGS_DIR, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_path = os.path.join(LOGS_DIR, f"run_{timestamp}.log")
+    log_file = open(log_path, "w", encoding="utf-8")  # noqa: SIM115
+    sys.stdout = TeeStream(sys.__stdout__, log_file)
+    sys.stderr = TeeStream(sys.__stderr__, log_file)
+    print(f"[LOG] Logging to {log_path}")
+    return log_path
 
 
 # ---------------------------------------------------------------------------
@@ -195,8 +244,38 @@ def prepare_pose_tensor(
 def generate_video_clip(
     pipe, ref_image, wav_path, poses_tensor,
     W, H, clip_frames, sample_rate, fps,
-    steps=4, cfg=1.0,
-) -> np.ndarray | None:
+    steps=4, cfg=1.0, init_latent=None, use_init_latent=True,  # NEW: Toggle for continuity
+) -> tuple[np.ndarray | None, torch.Tensor | None]:
+    """Generate a video clip and return both video frames and final latent.
+    
+    This function wraps the EchoMimic-v2 pipeline to generate a single clip.
+    When use_init_latent=True and init_latent is provided, the first frame
+    is initialized from the previous clip's final latent, ensuring continuity.
+    
+    Args:
+        pipe: EchoMimic-v2 pipeline instance
+        ref_image: Reference face image (PIL Image)
+        wav_path: Path to temporary audio file for this clip
+        poses_tensor: Pose guidance tensor for all frames
+        W, H: Output dimensions in pixels
+        clip_frames: Number of frames to generate
+        sample_rate: Audio sample rate (Hz)
+        fps: Frames per second
+        steps: Number of diffusion denoising steps
+        cfg: Classifier-free guidance scale
+        init_latent: Optional latent tensor from previous clip's final frame.
+                    Shape: (batch, channels, height, width) = (1, 4, 64, 64).
+                    When provided and use_init_latent=True, this initializes
+                    the first frame to ensure smooth continuity between clips.
+        use_init_latent: Boolean toggle for latent state preservation.
+                        If True, use init_latent for first frame initialization.
+                        If False, generate all frames from random noise (old behavior).
+        
+    Returns:
+        tuple: (video_np, final_latent)
+            - video_np: Generated video frames as numpy array, shape (1, 3, frames, H, W)
+            - final_latent: Latent tensor of the last frame for use in next clip
+    """
     generator = torch.manual_seed(random.randint(0, 2**32 - 1))
     result = pipe(
         ref_image, wav_path,
@@ -206,11 +285,17 @@ def generate_video_clip(
         audio_sample_rate=sample_rate,
         context_frames=12, fps=fps,
         context_overlap=3, start_idx=0,
+        init_latents=init_latent if use_init_latent else None,  # NEW: Conditional continuity
     )
     video = result.videos
+    final_latent = result.final_latent  # NEW: Extract for next clip
+    
     if isinstance(video, torch.Tensor):
-        return video.cpu().numpy()
-    return video
+        video_np = video.cpu().numpy()
+    else:
+        video_np = video
+    
+    return video_np, final_latent
 
 
 # ---------------------------------------------------------------------------
@@ -230,20 +315,39 @@ def _rms(audio: np.ndarray) -> float:
 
 def video_generation_thread(
     pipe, ref_image, pose_dir, pose_files,
-    audio_queue, frame_queue, stop_event,
+    audio_queue, raw_clip_queue, stop_event,
     sample_rate=16000, fps=24, clip_frames=12,
     W=512, H=512, steps=4, cfg=1.0,
-    audio_out_queue=None,
-    vad_threshold=0.005,
+    vad_threshold=0.005, use_init_latent=True,  # NEW: Toggle flag
 ):
+    """Diffusion-only thread: audio → pipeline → raw_clip_queue.
+
+    Continuously processes audio chunks from audio_queue, runs them through
+    the EchoMimic-v2 diffusion pipeline, and outputs raw video tensors to
+    raw_clip_queue for post-processing.
+    
+    Key features:
+    - VAD (Voice Activity Detection) filtering based on RMS threshold
+    - Optional latent state preservation for smooth clip-to-clip continuity
+    - Hands off raw outputs immediately to avoid blocking next clip generation
+    
+    Args:
+        use_init_latent: If True, preserve latent state across clips for continuity.
+                        If False, each clip starts from independent random noise.
+    """
     samples_per_clip = int(sample_rate * clip_frames / fps)
     audio_buffer = np.array([], dtype=np.float32)
     pose_idx = 0
+    last_latent = None  # NEW: Track last frame's latent for continuity
 
     print(f"[GEN] Waiting for audio (need {samples_per_clip} samples = "
           f"{clip_frames/fps:.2f}s per clip) ...")
     print(f"[GEN] Server-side VAD threshold: {vad_threshold:.4f} "
-          f"({'enabled' if vad_threshold > 0 else 'disabled'})")
+          f"{'enabled' if vad_threshold > 0 else 'disabled'}")
+    if use_init_latent:
+        print(f"[CONTINUITY] Latent state preservation ENABLED")
+    else:
+        print(f"[CONTINUITY] Latent state preservation DISABLED (old behavior)")
 
     while not stop_event.is_set():
         # Drain audio_queue into buffer
@@ -263,7 +367,6 @@ def video_generation_thread(
         # --- Server-side silence gate (layers 2 & 3) -----------------------
         clip_rms = _rms(clip_audio)
         if vad_threshold > 0 and clip_rms < vad_threshold:
-            # Silence — skip expensive diffusion, discard the clip
             print(f"[GEN] Silent clip discarded (RMS={clip_rms:.5f} < {vad_threshold:.4f})")
             continue
         # -------------------------------------------------------------------
@@ -286,33 +389,23 @@ def video_generation_thread(
             pose_idx = (pose_idx + clip_frames) % len(pose_files)
 
             t0 = time.perf_counter()
-            video_np = generate_video_clip(
+            # NEW: Pass and receive latent state for continuity
+            video_np, final_latent = generate_video_clip(
                 pipe, ref_image, tmp_wav_path, poses_tensor,
                 W, H, clip_frames, sample_rate, fps, steps, cfg,
+                init_latent=last_latent,  # NEW: Use previous clip's final latent
+                use_init_latent=use_init_latent,  # NEW: Toggle flag
             )
+            if use_init_latent:
+                last_latent = final_latent  # NEW: Save for next clip
+            
             dt = time.perf_counter() - t0
             print(f"[GEN] Clip generated in {dt:.2f}s "
                   f"({clip_frames} frames, {clip_frames/fps:.2f}s of video)")
 
+            # Hand off raw output immediately — don't block on post-processing
             if video_np is not None:
-                if audio_out_queue is not None:
-                    try:
-                        audio_out_queue.put_nowait(clip_audio.copy())
-                    except queue.Full:
-                        pass
-
-                n_frames = video_np.shape[2]
-                for f_idx in range(n_frames):
-                    if stop_event.is_set():
-                        return
-                    frame = video_np[0, :, f_idx, :, :]
-                    frame = (frame * 255).clip(0, 255).astype(np.uint8)
-                    frame = frame.transpose(1, 2, 0)
-                    frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-                    try:
-                        frame_queue.put_nowait(frame_bgr)
-                    except queue.Full:
-                        pass
+                raw_clip_queue.put((video_np, clip_audio.copy()))
 
         except Exception as e:
             print(f"[GEN] Error: {e}")
@@ -325,6 +418,48 @@ def video_generation_thread(
                     pass
 
 
+def postprocess_thread(
+    raw_clip_queue, frame_queue, audio_out_queue, stop_event,
+):
+    """Convert raw video tensors to BGR frames and push to delivery queues.
+
+    Runs concurrently with the generation thread so that clip N+1's
+    diffusion overlaps with clip N's post-processing and WebSocket send.
+    """
+    print("[POST] Post-processing thread started.")
+    while not stop_event.is_set():
+        try:
+            video_np, clip_audio = raw_clip_queue.get(timeout=0.1)
+        except queue.Empty:
+            continue
+
+        t0 = time.perf_counter()
+
+        # Push audio for this clip
+        if audio_out_queue is not None:
+            try:
+                audio_out_queue.put_nowait(clip_audio)
+            except queue.Full:
+                pass
+
+        # Convert and push each frame
+        n_frames = video_np.shape[2]
+        for f_idx in range(n_frames):
+            if stop_event.is_set():
+                return
+            frame = video_np[0, :, f_idx, :, :]
+            frame = (frame * 255).clip(0, 255).astype(np.uint8)
+            frame = frame.transpose(1, 2, 0)
+            frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+            try:
+                frame_queue.put_nowait(frame_bgr)
+            except queue.Full:
+                pass
+
+        dt = time.perf_counter() - t0
+        print(f"[POST] {n_frames} frames post-processed in {dt*1000:.1f}ms")
+
+
 # ---------------------------------------------------------------------------
 # Web server
 # ---------------------------------------------------------------------------
@@ -333,6 +468,7 @@ async def run_server(pipe, ref_image, pose_dir, pose_files, args):
     from aiohttp import web
 
     audio_queue = queue.Queue()
+    raw_clip_queue = queue.Queue(maxsize=4)  # buffer up to 4 raw clips
     frame_queue = queue.Queue(maxsize=200)
     audio_out_queue = queue.Queue(maxsize=50)
     stop_event = threading.Event()
@@ -341,14 +477,24 @@ async def run_server(pipe, ref_image, pose_dir, pose_files, args):
         target=video_generation_thread,
         args=(
             pipe, ref_image, pose_dir, pose_files,
-            audio_queue, frame_queue, stop_event,
+            audio_queue, raw_clip_queue, stop_event,
             args.sample_rate, args.fps, args.clip_frames,
             args.width, args.height, args.steps, args.cfg,
         ),
-        kwargs={"audio_out_queue": audio_out_queue, "vad_threshold": args.vad_threshold},
+        kwargs={
+            "vad_threshold": args.vad_threshold,
+            "use_init_latent": args.use_init_latent,  # NEW: Pass flag
+        },
         daemon=True,
     )
     gen_thread.start()
+
+    post_thread = threading.Thread(
+        target=postprocess_thread,
+        args=(raw_clip_queue, frame_queue, audio_out_queue, stop_event),
+        daemon=True,
+    )
+    post_thread.start()
 
     # Read index.html once at startup
     with open(INDEX_HTML_PATH, "r", encoding="utf-8") as f:
@@ -449,13 +595,18 @@ def main():
     parser.add_argument("--clip-frames", type=int, default=12)
     parser.add_argument("--width", type=int, default=512)
     parser.add_argument("--height", type=int, default=512)
-    parser.add_argument("--steps", type=int, default=4)
+    parser.add_argument("--steps", type=int, default=6)
     parser.add_argument("--cfg", type=float, default=1.0)
     parser.add_argument("--port", type=int, default=8080)
     parser.add_argument("--vad-threshold", type=float, default=0.005,
                         help="Server-side RMS silence threshold (0.0 = disabled). "
                              "Clips below this are discarded.")
+    parser.add_argument("--use-init-latent", action=argparse.BooleanOptionalAction, default=True,
+                        help="Enable latent state preservation for continuity between clips. "
+                             "Use --no-use-init-latent to disable (old behavior).")
     args = parser.parse_args()
+
+    setup_logging()
 
     pipe = load_pipeline(args.config, DEVICE, WEIGHT_DTYPE)
 

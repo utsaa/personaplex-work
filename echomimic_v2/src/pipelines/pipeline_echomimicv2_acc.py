@@ -29,6 +29,7 @@ from src.pipelines.step_func import origin_by_velocity_and_sample, psuedo_veloci
 @dataclass
 class EchoMimicV2PipelineOutput(BaseOutput):
     videos: Union[torch.Tensor, np.ndarray]
+    final_latent: Optional[torch.Tensor] = None  # Last frame's latent for continuity
 
 
 class EchoMimicV2Pipeline(DiffusionPipeline):
@@ -220,7 +221,8 @@ class EchoMimicV2Pipeline(DiffusionPipeline):
         dtype,
         device,
         generator,
-        context_frame_length
+        context_frame_length,
+        init_latents=None,  # NEW: Optional initial latent for first frame
     ):
         shape = (
             batch_size,
@@ -245,6 +247,12 @@ class EchoMimicV2Pipeline(DiffusionPipeline):
         
         latents = torch.clamp(latents_seg, -1.5, 1.5)
 
+        # NEW: Initialize first frame from previous clip's last frame if provided
+        if init_latents is not None:
+            print(f"[CONTINUITY] Initializing first frame from previous clip's final latent")
+            # init_latents shape: (batch, channels, height, width)
+            # We replace the first frame (index 0 in temporal dimension)
+            latents[:, :, 0, :, :] = init_latents.to(device=device, dtype=dtype)
 
         # scale the initial noise by the standard deviation required by the scheduler
         latents = latents * self.scheduler.init_noise_sigma
@@ -326,6 +334,7 @@ class EchoMimicV2Pipeline(DiffusionPipeline):
         fps=25,
         audio_margin=2,
         start_idx=0,
+        init_latents=None,  # NEW: Optional latent from previous clip's last frame
         **kwargs,
     ):
         # Default height and width to unet
@@ -375,7 +384,8 @@ class EchoMimicV2Pipeline(DiffusionPipeline):
             audio_fea_final.dtype,
             device,
             generator,
-            context_frames
+            context_frames,
+            init_latents=init_latents,  # NEW: Pass initial latent for continuity
         )
         
         pose_enocder_tensor = self.pose_encoder(poses_tensor)
@@ -506,6 +516,9 @@ class EchoMimicV2Pipeline(DiffusionPipeline):
             reference_control_reader.clear()
             reference_control_writer.clear()
 
+        # NEW: Extract final latent (last frame) before decoding for next clip's continuity
+        final_latent = latents[:, :, -1, :, :].clone()  # Shape: (batch, channels, height, width)
+
         if interpolation_factor > 0:
             latents = self.interpolate_latents(latents, interpolation_factor, device)
         # Post-processing
@@ -518,4 +531,4 @@ class EchoMimicV2Pipeline(DiffusionPipeline):
         if not return_dict:
             return images
 
-        return EchoMimicV2PipelineOutput(videos=images)
+        return EchoMimicV2PipelineOutput(videos=images, final_latent=final_latent)
