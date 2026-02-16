@@ -353,9 +353,13 @@ def video_generation_thread(
 
     pose_idx = 0
     last_latent = None 
+    
+    consecutive_silent_clips = 0
+    idle_clips_limit = max(1, int(1.0 * fps / clip_frames))  # how many clips in 1s
 
     print(f"[GEN] Waiting for audio (target clip: {samples_per_clip} samples) ...")
     print(f"[GEN] Audio Context: Rolling 1.5s window (1.0s history + 0.5s new)")
+    print(f"[GEN] Silence timeout: 1.0s (stop updating after {idle_clips_limit} silent clips)")
 
     while not stop_event.is_set():
         # Drain audio_queue into incoming buffer
@@ -365,6 +369,12 @@ def video_generation_thread(
                 incoming_audio_buffer = np.concatenate((incoming_audio_buffer, chunk))
         except queue.Empty:
             pass
+
+        # 1. Backlog Catch-up: if we are > 1.5s behind, skip old audio to stay live
+        if len(incoming_audio_buffer) > (samples_per_clip * 3):
+            dropped_count = len(incoming_audio_buffer) - samples_per_clip
+            print(f"[GEN] Backlog detected! Dropping {dropped_count} samples ({dropped_count/sample_rate:.2f}s) to keep up.")
+            incoming_audio_buffer = incoming_audio_buffer[-samples_per_clip:]
 
         # Check if we have enough "new" audio for a clip
         if len(incoming_audio_buffer) < samples_per_clip:
@@ -376,15 +386,28 @@ def video_generation_thread(
 
         # --- Server-side silence gate (on new audio only) ------------------
         clip_rms = _rms(current_clip_audio)
+        
         if vad_threshold > 0 and clip_rms < vad_threshold:
-            print(f"[GEN] Silent clip discarded (RMS={clip_rms:.5f} < {vad_threshold:.4f})")
-            # Even if discarded, we might want to update history? 
-            # Ideally yes, silence is also context.
-            # Shift history buffer
-            audio_history_buffer = np.concatenate((audio_history_buffer, current_clip_audio))[-history_samples:]
-            # Reset continuity if silence is long? For now, keep simple.
-            # last_latent = None # Optional: reset latent on silence
+            consecutive_silent_clips += 1
+            # Only update history/log for the first second of silence
+            if consecutive_silent_clips <= idle_clips_limit:
+                print(f"[GEN] Silent clip (RMS={clip_rms:.5f} < {vad_threshold:.5f}) - Discarded.")
+                audio_history_buffer = np.concatenate((audio_history_buffer, current_clip_audio))[-history_samples:]
+            else:
+                # Periodic idle message
+                if consecutive_silent_clips % (idle_clips_limit * 6) == 0: # roughly every 6s
+                     print(f"[GEN] System idle (RMS={clip_rms:.5f})...")
+                
+                # If silent for a long time, reset latent continuity to avoid artifacts on next speech
+                if consecutive_silent_clips > (idle_clips_limit * 4): # > 4s
+                    last_latent = None
+
             continue
+        
+        # We got speech!
+        if consecutive_silent_clips > 0:
+             print(f"[GEN] Audio detected (RMS={clip_rms:.5f} > {vad_threshold:.5f}). Generation starting...")
+        consecutive_silent_clips = 0
         # -------------------------------------------------------------------
 
         # Prepare the full 1.5s window for Whisper
@@ -569,6 +592,13 @@ async def run_server(pipe, ref_image, pose_dir, pose_files, args):
         ws = web.WebSocketResponse()
         await ws.prepare(request)
         print("[WEB] Client connected.")
+
+        # Clear any stale audio from previous sessions
+        while not audio_queue.empty():
+            try:
+                audio_queue.get_nowait()
+            except queue.Empty:
+                break
 
         fps = args.fps
 
