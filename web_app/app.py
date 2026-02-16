@@ -553,7 +553,7 @@ async def run_server(pipe, ref_image, pose_dir, pose_files, args):
 
     audio_queue = queue.Queue()
     raw_clip_queue = queue.Queue(maxsize=4)
-    socket_queue = queue.Queue(maxsize=200)
+    socket_queue = queue.Queue(maxsize=300)
     stop_event = threading.Event()
 
     gen_thread = threading.Thread(
