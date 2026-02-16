@@ -24,6 +24,7 @@ import tempfile
 import threading
 import time
 import wave
+import concurrent.futures
 
 import cv2
 import numpy as np
@@ -323,11 +324,83 @@ def generate_video_clip(
 # Utility: RMS energy of an audio buffer
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Utility: RMS energy & Input Helper
+# ---------------------------------------------------------------------------
+
 def _rms(audio: np.ndarray) -> float:
     """Return the root-mean-square energy of a float32 PCM buffer."""
     if len(audio) == 0:
         return 0.0
     return float(np.sqrt(np.mean(audio ** 2)))
+
+
+def _prepare_clip_inputs(
+    audio_chunk, audio_history, sample_rate, 
+    pose_dir, pose_files, pose_idx, clip_frames, 
+    W, H, device, dtype, fps
+):
+    """
+    Worker function to prepare inputs for a single clip.
+    Returns: (tmp_wav_path, poses_tensor, updated_history, next_pose_idx, context_video_frames)
+    """
+    # 1. Update history locally for context calculation
+    # (Note: we don't return the full buffer, just the slice needed for NEXT context if we were chaining,
+    # but in the main loop we manage the authoritative history buffer. 
+    # Actually, to pre-calc N+1, we need result of N's history update. 
+    # So we must return the updated history for the main thread to use for N+2 pre-calc?
+    # No, main thread can update its history buffer 'optimistically' before submitting?
+    # YES. distinct separation:
+    #   - Main thread manages `audio_history_buffer` state.
+    #   - Main thread constructs `full_audio_window` for the worker.
+    #   - Worker writes WAV and computes Pose.
+    
+    # Let's adjust signature to take `full_audio_window` directly.
+    pass
+
+# Redefining to be cleaner:
+def _prepare_clip_inputs_safe(
+    full_audio_window, 
+    sample_rate,
+    pose_dir, pose_files, pose_idx, clip_frames, 
+    W, H, device, dtype, fps
+):
+    """
+    Offloadable input preparation task.
+    """
+    # Audio Context Calculation
+    # We assume full_audio_window = [history] + [current]
+    # We need to know how much is history to set audio_context_frames.
+    # But `audio_context_frames` depends on the history length.
+    # We'll calculate it based on the assumption that `current` is `samples_per_clip`?
+    # No, caller should pass `context_video_frames`.
+    
+    # Let's write WAV
+    tmp_wav_path = None
+    try:
+        tmp_fd, tmp_wav_path = tempfile.mkstemp(suffix=".wav")
+        os.close(tmp_fd)
+        with wave.open(tmp_wav_path, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(sample_rate)
+            pcm_int16 = np.clip(full_audio_window * 32767, -32768, 32767).astype(np.int16)
+            wf.writeframes(pcm_int16.tobytes())
+            
+        # Pose
+        poses_tensor = prepare_pose_tensor(
+            pose_dir, pose_files, clip_frames, pose_idx, W, H,
+            device=device, dtype=dtype,
+        )
+        
+        next_pose_idx = (pose_idx + clip_frames) % len(pose_files)
+        
+        return tmp_wav_path, poses_tensor, next_pose_idx
+        
+    except Exception as e:
+        if tmp_wav_path and os.path.exists(tmp_wav_path):
+            os.unlink(tmp_wav_path)
+        raise e
 
 
 def video_generation_thread(
@@ -361,119 +434,182 @@ def video_generation_thread(
     print(f"[GEN] Audio Context: Rolling 1.5s window (1.0s history + 0.5s new)")
     print(f"[GEN] Silence timeout: 1.0s (stop updating after {idle_clips_limit} silent clips)")
 
+    # Thread pool for input prefetching (overlap CPU prep with GPU denoise)
+    input_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    # Future for the NEXT clip's inputs
+    next_input_future = None
+    
+    # State validation
+    if pose_files is None or len(pose_files) == 0:
+         print("[ERROR] No pose files provided!")
+         return
+
     while not stop_event.is_set():
         # Drain audio_queue into incoming buffer
         try:
             while True:
-                chunk = audio_queue.get(timeout=0.05)
+                chunk = audio_queue.get(timeout=0.01) # Low timeout to keep loop responsive
                 incoming_audio_buffer = np.concatenate((incoming_audio_buffer, chunk))
         except queue.Empty:
             pass
 
-        # No backlog dropping — process clips sequentially from the FIFO.
-        # Generation takes ~3s per 0.5s clip (6:1 ratio), so the system
-        # runs a few seconds behind real-time. This is acceptable because:
-        #   - Every word is faithfully generated (no skipped audio)
-        #   - Audio + Video arrive in sync at the client
-        #   - Dropping audio always produces garbage (silent tails) or gaps
-        #
-        # If the user stops speaking, the pipeline will naturally catch up
-        # as the generation thread processes remaining buffered audio.
-
-        # Check if we have enough audio for a clip
-        if len(incoming_audio_buffer) < samples_per_clip:
-            continue
-
-        # Extract the exact 0.5s clip
-        current_clip_audio = incoming_audio_buffer[:samples_per_clip]
-        incoming_audio_buffer = incoming_audio_buffer[samples_per_clip:]
-
-        # --- Server-side silence gate (on new audio only) ------------------
-        clip_rms = _rms(current_clip_audio)
+        # -------------------------------------------------------------
+        # 1. Fetch/Prepare Inputs for CURRENT clip
+        # -------------------------------------------------------------
         
-        if vad_threshold > 0 and clip_rms < vad_threshold:
-            consecutive_silent_clips += 1
-            # Only update history/log for the first second of silence
-            if consecutive_silent_clips <= idle_clips_limit:
-                print(f"[GEN] Silent clip (RMS={clip_rms:.5f} < {vad_threshold:.5f}) - Discarded.")
-                audio_history_buffer = np.concatenate((audio_history_buffer, current_clip_audio))[-history_samples:]
-            else:
-                # Periodic idle message
-                if consecutive_silent_clips % (idle_clips_limit * 6) == 0: # roughly every 6s
-                     print(f"[GEN] System idle (RMS={clip_rms:.5f})...")
+        current_inputs = None # (wav_path, poses_tensor, context_frames, audio_chunk_ref)
+        
+        # A. Check if we have pre-computed inputs from previous iteration
+        if next_input_future is not None:
+            try:
+                # Wait for pre-computation to finish
+                wav_path, poses, _, ctx_frames, audio_ref = next_input_future.result()
+                current_inputs = (wav_path, poses, ctx_frames, audio_ref)
+                next_input_future = None # Consumed
+            except Exception as e:
+                print(f"[GEN] Prefetch error: {e}")
+                next_input_future = None
+
+        # B. If no pre-computed inputs (first loop or starved), try to prepare now
+        if current_inputs is None:
+            if len(incoming_audio_buffer) >= samples_per_clip:
+                current_audio = incoming_audio_buffer[:samples_per_clip]
+                incoming_audio_buffer = incoming_audio_buffer[samples_per_clip:]
                 
-                # If silent for a long time, reset latent continuity to avoid artifacts on next speech
-                if consecutive_silent_clips > (idle_clips_limit * 4): # > 4s
-                    last_latent = None
+                # Silence Gate
+                clip_rms = _rms(current_audio)
+                if vad_threshold > 0 and clip_rms < vad_threshold:
+                    consecutive_silent_clips += 1
+                    if consecutive_silent_clips <= idle_clips_limit:
+                         print(f"[GEN] Silent clip (RMS={clip_rms:.5f}) - Discarded.")
+                         audio_history_buffer = np.concatenate((audio_history_buffer, current_audio))[-history_samples:]
+                    elif consecutive_silent_clips % (idle_clips_limit * 6) == 0:
+                         print(f"[GEN] System idle...")
+                    if consecutive_silent_clips > (idle_clips_limit * 4):
+                        last_latent = None
+                    continue # Skip generation
+                
+                # Speech detected
+                if consecutive_silent_clips > 0:
+                     print(f"[GEN] Audio detected. Starting...")
+                consecutive_silent_clips = 0
+                
+                # Prepare Inputs Synchronously (Fallback)
+                full_window = np.concatenate((audio_history_buffer, current_audio))
+                ctx_duration = len(audio_history_buffer) / sample_rate
+                ctx_frames = int(ctx_duration * fps)
+                
+                try:
+                    wav_path, poses, next_pidx = _prepare_clip_inputs_safe(
+                        full_window, sample_rate, pose_dir, pose_files, pose_idx, clip_frames,
+                        W, H, DEVICE, WEIGHT_DTYPE, fps
+                    )
+                    current_inputs = (wav_path, poses, ctx_frames, current_audio)
+                    # Update state immediately so prefetch can use new state
+                    # Note: We update pose_idx HERE for the current clip
+                    # (The helper returns next_pidx, but we just increment locally to keep it simple/linear if synced)
+                    # Actually, let's just use the linear logic:
+                    pose_idx = next_pidx 
+                    
+                except Exception as e:
+                    print(f"[GEN] Prep error: {e}")
+                    continue
+            else:
+                # Not enough audio, wait more
+                continue
 
-            continue
+        # Unpack valid current_inputs
+        tmp_wav_path, poses_tensor, context_video_frames, current_clip_audio = current_inputs
         
-        # We got speech!
-        if consecutive_silent_clips > 0:
-             print(f"[GEN] Audio detected (RMS={clip_rms:.5f} > {vad_threshold:.5f}). Generation starting...")
-        consecutive_silent_clips = 0
-        # -------------------------------------------------------------------
+        # Update history buffer immediately (so next prefetch sees it)
+        # We append the audio used for THIS clip to the history
+        # Note: 'audio_history_buffer' is the state at START of this clip. 
+        # We need to update it to be state at END of this clip (Start of NEW clip)
+        new_history_buffer = np.concatenate((audio_history_buffer, current_clip_audio))[-history_samples:]
+        
+        # -------------------------------------------------------------
+        # 2. Prefetch NEXT clip (Overlap with GPU)
+        # -------------------------------------------------------------
+        # Do we have enough audio for N+1?
+        if len(incoming_audio_buffer) >= samples_per_clip and next_input_future is None:
+            # Peak at next audio
+            next_audio = incoming_audio_buffer[:samples_per_clip]
+            # (Don't consume from buffer yet? If we do, we commit to it. 
+            #  Yes, consume it. If prefetch fails, we drop it? No, handle gracefully?
+            #  Simplest: Consume it. We are committed.)
+            incoming_audio_buffer = incoming_audio_buffer[samples_per_clip:]
+            
+            # Check silence for NEXT clip
+            next_rms = _rms(next_audio)
+            is_silent = (vad_threshold > 0 and next_rms < vad_threshold)
+            
+            if is_silent:
+                # Handle silent N+1 immediately (fast path, no GPU needed)
+                # We can't really "skip" it effectively in a future without complex logic.
+                # If silent, maybe just don't prefetch? Let main loop handle it as "Fallback" (B) above?
+                # YES. If silent, just put it back? Or let main loop handle it.
+                # To keep logic simple: ONLY prefetch if it looks like valid speech.
+                # If silent, we let the main loop process it (fast discard).
+                # We prepend it back? No, `incoming_audio_buffer` is numpy.
+                incoming_audio_buffer = np.concatenate((next_audio, incoming_audio_buffer)) # Put back
+            else:
+                # Valid speech -> Prefetch!
+                # Construct window for N+1 using 'new_history_buffer'
+                next_full_window = np.concatenate((new_history_buffer, next_audio))
+                next_ctx_duration = len(new_history_buffer) / sample_rate
+                next_ctx_frames = int(next_ctx_duration * fps)
+                
+                # Submit to thread pool
+                print("[PREFETCH] Starting inputs for next clip...")
+                
+                # Careful with pose_idx: current clip made it 'pose_idx'. Next needs that value.
+                # We already updated 'pose_idx' above after getting current_inputs.
+                
+                # Define a closure or partial to bundle args
+                next_input_future = input_executor.submit(
+                     _runner_prepare_inputs, # Wrapper to return extra metadata
+                     next_full_window, sample_rate, pose_dir, pose_files, pose_idx, clip_frames,
+                     W, H, DEVICE, WEIGHT_DTYPE, fps,
+                     next_ctx_frames, next_audio 
+                )
+                
+                # Advance local state *speculatively* for N+2?
+                # The pose_idx for N+2 will be (pose_idx + clip_frames)
+                pose_idx = (pose_idx + clip_frames) % len(pose_files)
+                # The history for N+2 will be updated in next loop.
+                # But wait, we updated `audio_history_buffer` to `new_history_buffer` above.
+                # Does `audio_history_buffer` need to be correct for N+2? 
+                # Yes. At top of loop N+1, `audio_history_buffer` must be `new_history_buffer`.
+                # So we update it now:
+                # audio_history_buffer = new_history_buffer # Done below?
 
-        # Prepare the full 1.5s window for Whisper
-        # window = [history (1.0s)] + [current (0.5s)]
-        full_audio_window = np.concatenate((audio_history_buffer, current_clip_audio))
+        # Commit input history update
+        audio_history_buffer = new_history_buffer
         
-        # Calculate how many audio frames correspond to the history (to tell pipeline to skip them)
-        # Whisper (tiny) typically outputs 50 frames per second. 
-        # But we pass `audio_context_frames` to the pipeline, which iterates over `whisper_chunks`.
-        # `whisper_chunks` size depends on fps.
-        # Logic: output video frames = clip_frames. 
-        # The pipeline aligns audio chunks to video frames. 
-        # If we pass 1.5s of audio, we get ~36 video frames worth of audio features.
-        # We want to skip the first ~24 frames (1.0s) and generate the last 12 frames (0.5s).
-        # Precise calculation: 
-        # context_duration = len(audio_history_buffer) / sample_rate
-        # context_video_frames = int(context_duration * fps)
-        
-        context_duration = len(audio_history_buffer) / sample_rate
-        context_video_frames = int(context_duration * fps)
-
-        tmp_wav_path = None
+        # -------------------------------------------------------------
+        # 3. Generate (GPU)
+        # -------------------------------------------------------------
         try:
-            tmp_fd, tmp_wav_path = tempfile.mkstemp(suffix=".wav")
-            os.close(tmp_fd)
-            with wave.open(tmp_wav_path, "wb") as wf:
-                wf.setnchannels(1)
-                wf.setsampwidth(2)
-                wf.setframerate(sample_rate)
-                pcm_int16 = np.clip(full_audio_window * 32767, -32768, 32767).astype(np.int16)
-                wf.writeframes(pcm_int16.tobytes())
-
-            poses_tensor = prepare_pose_tensor(
-                pose_dir, pose_files, clip_frames, pose_idx, W, H,
-                device=DEVICE, dtype=WEIGHT_DTYPE,
-            )
-            pose_idx = (pose_idx + clip_frames) % len(pose_files)
-
             t0 = time.perf_counter()
-            # Generate
             video_np, final_latent = generate_video_clip(
                 pipe, ref_image, tmp_wav_path, poses_tensor,
                 W, H, clip_frames, sample_rate, fps, steps, cfg,
                 init_latent=last_latent,
                 use_init_latent=use_init_latent,
                 audio_margin=audio_margin,
-                reference_cache=reference_cache, # NEW
-                audio_context_frames=context_video_frames, # NEW
+                reference_cache=reference_cache,
+                audio_context_frames=context_video_frames,
             )
+            
             if use_init_latent:
                 last_latent = final_latent 
             
             dt = time.perf_counter() - t0
-            print(f"[GEN] Clip generated in {dt:.2f}s "
-                  f"({clip_frames} frames). Context: {context_video_frames} frames skipped.")
+            print(f"[GEN] Clip generated in {dt:.2f}s ")
 
-            # Append current clip to history (rolling buffer)
-            audio_history_buffer = np.concatenate((audio_history_buffer, current_clip_audio))[-history_samples:]
-
-            # Hand off raw output
+            # Hand off
             if video_np is not None:
-                raw_clip_queue.put((video_np, current_clip_audio.copy())) # Send ONLY new audio
+                raw_clip_queue.put((video_np, current_clip_audio.copy()))
 
         except Exception as e:
             print(f"[GEN] Error: {e}")
@@ -484,6 +620,13 @@ def video_generation_thread(
                     os.unlink(tmp_wav_path)
                 except OSError:
                     pass
+
+def _runner_prepare_inputs(full_win, sr, pd, pf, pidx, cf, w, h, dev, dt, fps, ctx_frames, audio_ref):
+    # Wrapper to unpack/pack for future
+    wav, poses, next_pidx = _prepare_clip_inputs_safe(
+        full_win, sr, pd, pf, pidx, cf, w, h, dev, dt, fps
+    )
+    return wav, poses, next_pidx, ctx_frames, audio_ref
 
 
 def postprocess_thread(
@@ -708,11 +851,25 @@ def main():
                              "Use --no-use-init-latent to disable (old behavior).")
     parser.add_argument("--audio-margin", type=int, default=2,
                         help="Audio feature context margin (frames). Higher = more context for lip sync.")
+    parser.add_argument("--compile-unet", action="store_true",
+                        help="Enable torch.compile for the denoising UNet (optimization).")
     args = parser.parse_args()
 
     setup_logging()
 
     pipe = load_pipeline(args.config, DEVICE, WEIGHT_DTYPE)
+
+    if args.compile_unet:
+        print("[INIT] Compiling Denoising UNet with torch.compile(mode='reduce-overhead', backend='inductor')...")
+        print("[INIT] First inference will incur a warmup delay (30-60s).")
+        try:
+             pipe.denoising_unet = torch.compile(
+                 pipe.denoising_unet, 
+                 mode="reduce-overhead",
+                 backend="inductor"
+             )
+        except Exception as e:
+             print(f"[WARN] Compilation failed: {e}. Fallback to eager mode.")
 
     assert os.path.exists(args.reference_image), f"Not found: {args.reference_image}"
     ref_image = Image.open(args.reference_image).convert("RGB")
