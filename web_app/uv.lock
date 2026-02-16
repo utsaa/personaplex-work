@@ -1691,6 +1691,11 @@ wheels = [
 ]
 
 [[package]]
+name = "torchao"
+version = "0.17.0+git9cd41075"
+source = { git = "https://github.com/pytorch/ao.git#9cd4107562b35cb5e3c71fda77af0f5c7af90c3f" }
+
+[[package]]
 name = "torchaudio"
 version = "2.8.0+cu126"
 source = { registry = "https://download.pytorch.org/whl/cu126" }
@@ -1838,6 +1843,7 @@ dependencies = [
     { name = "safetensors", marker = "(platform_machine == 'x86_64' and sys_platform == 'linux') or sys_platform == 'win32'" },
     { name = "soundfile", marker = "(platform_machine == 'x86_64' and sys_platform == 'linux') or sys_platform == 'win32'" },
     { name = "torch", marker = "(platform_machine == 'x86_64' and sys_platform == 'linux') or sys_platform == 'win32'" },
+    { name = "torchao", marker = "(platform_machine == 'x86_64' and sys_platform == 'linux') or sys_platform == 'win32'" },
     { name = "torchaudio", marker = "(platform_machine == 'x86_64' and sys_platform == 'linux') or sys_platform == 'win32'" },
     { name = "torchvision", marker = "(platform_machine == 'x86_64' and sys_platform == 'linux') or sys_platform == 'win32'" },
     { name = "tqdm", marker = "(platform_machine == 'x86_64' and sys_platform == 'linux') or sys_platform == 'win32'" },
@@ -1864,6 +1870,7 @@ requires-dist = [
     { name = "safetensors" },
     { name = "soundfile" },
     { name = "torch", index = "https://download.pytorch.org/whl/cu126" },
+    { name = "torchao", git = "https://github.com/pytorch/ao.git" },
     { name = "torchaudio", index = "https://download.pytorch.org/whl/cu126" },
     { name = "torchvision", index = "https://download.pytorch.org/whl/cu126" },
     { name = "tqdm" },

@@ -65,12 +65,15 @@ pip install -e .
 uv run --directory web_app python app.py --port 8080 \
     --audio-margin 6 \
     --use-init-latent \
-    --compile-unet
+    --compile-unet \
+    --quantize-fp8 (if need to save VRAM)
 ```
 
 Or with python directly (inside `web_app/`):
 
 ```bash
+python app.py --port 8080 --audio-margin 6 --use-init-latent --compile-unet --quantize-fp8 (if need to save VRAM)
+else
 python app.py --port 8080 --audio-margin 6 --use-init-latent --compile-unet
 ```
 
@@ -117,6 +120,7 @@ The web app includes several advanced optimizations for low-latency, real-time p
 | `--audio-margin` | `2` | **Recommended: 6**. Audio feature context margin. Higher values use more overlap for better sync. |
 | `--use-init-latent` | `True` | **Recommended: Enable**. Preserves latent state for smooth continuity. |
 | `--compile-unet` | `False` | **Recommended: Enable**. Compiles UNet for faster inference (adds startup delay). |
+| `--quantize-fp8` | `False` | **Optional**. Quantize UNet to FP8 (requires L4/H100/4090). ~1.8x speedup. |
 | `--config` | `.../infer_acc.yaml` | Pipeline config path |
 | `--reference-image` | `.../therapist_ref.png` | Reference face image |
 | `--pose-dir` | `.../pose/01` | Directory of `.npy` pose files |

@@ -27,6 +27,7 @@ dependencies = [
     "torchvision",
     "torchaudio",
     "xformers>=0.0.32.post2",
+    "torchao",
 ]
 
 [project.optional-dependencies]
@@ -41,6 +42,7 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [tool.uv]
+no-build-isolation-package = ["torchao"]
 prerelease = "allow"
 package = true
 # This limits uv's "thinking" to just x86_64 Linux (our container platform)
@@ -70,3 +72,4 @@ explicit = true
 torch = { index = "pytorch-gpu" }
 torchvision = { index = "pytorch-gpu" }
 torchaudio = { index = "pytorch-gpu" }
+torchao = { git = "https://github.com/pytorch/ao.git" }

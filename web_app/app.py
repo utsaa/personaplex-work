@@ -912,19 +912,45 @@ def main():
                         help="Audio feature context margin (frames). Higher = more context for lip sync.")
     parser.add_argument("--compile-unet", action="store_true",
                         help="Enable torch.compile for the denoising UNet (optimization).")
+    parser.add_argument("--quantize-fp8", action=argparse.BooleanOptionalAction, default=False,
+                        help="Quantize UNet to FP8 (requires torchao & L4/H100/4090 GPU).")
+    
     args = parser.parse_args()
 
     setup_logging()
 
     pipe = load_pipeline(args.config, DEVICE, WEIGHT_DTYPE)
 
+    quantization_enabled = False
+    if args.quantize_fp8:
+        try:
+            # Modern Config-based API (Recommended for 2026)
+            from torchao.quantization import quantize_, Float8WeightOnlyConfig
+            print("[INIT] Quantizing Denoising UNet to FP8 (weight-only)...")
+            quantize_(pipe.denoising_unet, Float8WeightOnlyConfig())
+            quantization_enabled = True
+        except ImportError:
+            try:
+                # Fallback to the alias function you were using
+                from torchao.quantization import quantize_, float8_weight_only
+                print("[INIT] Using float8_weight_only alias...")
+                quantize_(pipe.denoising_unet, float8_weight_only())
+                quantization_enabled = True
+            except ImportError:
+                print("[ERROR] torchao not found. Please install via 'uv pip install torchao'")
+                quantization_enabled = False
+        except Exception as e:
+            print(f"[ERROR] FP8 Quantization failed: {e}")
+
     if args.compile_unet:
-        print("[INIT] Compiling Denoising UNet with torch.compile(mode='reduce-overhead', backend='inductor')...")
+        # Only use max-autotune if we actually quantized (otherwise it takes forever for small gain)
+        mode = "max-autotune" if quantization_enabled else "reduce-overhead"
+        print(f"[INIT] Compiling Denoising UNet with torch.compile(mode='{mode}', backend='inductor')...")
         print("[INIT] First inference will incur a warmup delay (30-60s).")
         try:
              pipe.denoising_unet = torch.compile(
                  pipe.denoising_unet, 
-                 mode="reduce-overhead",
+                 mode=mode,
                  backend="inductor"
              )
         except Exception as e:
