@@ -58,23 +58,17 @@ pip install -e .
 
 ## Running
 
-**Recommended Command (Optimized):**
+### Performance Flags
+- `--compile-unet`: Enables `torch.compile` for the denoising phase.
+- `--compile-unet-mode [mode]`: Choose compilation strategy (Default: `reduce-overhead`).
+  - `reduce-overhead`: Balanced startup time (~60s) and high performance. Recommended.
+  - `max-autotune`: Aggressive benchmarking for peak GPU performance. One-time 5-10 min delay.
+  - `default`: Standard PyTorch compilation.
+- `--quantize-fp8`: Enables 8-bit weight quantization via `torchao`. Reduces VRAM and boosts speed on RTX 4090/H100.
 
+**Run Optimized (RTX 4090 Recommended):**
 ```bash
-# Using uv (from parent directory)
-uv run --directory web_app python app.py --port 8080 \
-    --audio-margin 6 \
-    --use-init-latent \
-    --compile-unet \
-    --quantize-fp8 (if need to save VRAM)
-```
-
-Or with python directly (inside `web_app/`):
-
-```bash
-python app.py --port 8080 --audio-margin 6 --use-init-latent --compile-unet --quantize-fp8 (if need to save VRAM)
-else
-python app.py --port 8080 --audio-margin 6 --use-init-latent --compile-unet
+uv run python app.py --port 8080 --compile-unet --compile-unet-mode reduce-overhead --quantize-fp8 --steps 4 --audio-margin 6 --use-init-latent
 ```
 
 Then open **http://localhost:8080** in your browser.

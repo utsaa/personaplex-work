@@ -911,7 +911,13 @@ def main():
     parser.add_argument("--audio-margin", type=int, default=2,
                         help="Audio feature context margin (frames). Higher = more context for lip sync.")
     parser.add_argument("--compile-unet", action="store_true",
-                        help="Enable torch.compile for the denoising UNet (optimization).")
+                        help="Enable torch.compile for the denoising UNet.")
+    parser.add_argument("--compile-unet-mode", type=str, default="reduce-overhead",
+                        help="Mode for torch.compile. Valid values: "
+                             "'default' (standard), "
+                             "'reduce-overhead' (faster startup, stable performance - RECOMMENDED), "
+                             "'max-autotune' (intensive benchmarking, fastest inference), "
+                             "'max-autotune-no-cudagraphs' (benchmarking without CUDA graphs).")
     parser.add_argument("--quantize-fp8", action=argparse.BooleanOptionalAction, default=False,
                         help="Quantize UNet to FP8 (requires torchao & L4/H100/4090 GPU).")
     
@@ -943,8 +949,12 @@ def main():
             print(f"[ERROR] FP8 Quantization failed: {e}")
 
     if args.compile_unet:
-        # Only use max-autotune if we actually quantized (otherwise it takes forever for small gain)
-        mode = "max-autotune" if quantization_enabled else "reduce-overhead"
+        valid_modes = ["default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"]
+        if args.compile_unet_mode not in valid_modes:
+            raise ValueError(f"Invalid mode --compile-unet-mode='{args.compile_unet_mode}'. "
+                             f"Must be one of: {valid_modes}")
+
+        mode = args.compile_unet_mode
         print(f"[INIT] Compiling Denoising UNet with torch.compile(mode='{mode}', backend='inductor')...")
         print("[INIT] First inference will incur a warmup delay (30-60s).")
         try:
