@@ -244,7 +244,8 @@ def prepare_pose_tensor(
 def generate_video_clip(
     pipe, ref_image, wav_path, poses_tensor,
     W, H, clip_frames, sample_rate, fps,
-    steps=4, cfg=1.0, init_latent=None, use_init_latent=True,  # NEW: Toggle for continuity
+    steps=4, cfg=1.0, init_latent=None, use_init_latent=True,
+    audio_margin=2,  # NEW: Audio context margin
 ) -> tuple[np.ndarray | None, torch.Tensor | None]:
     """Generate a video clip and return both video frames and final latent.
     
@@ -285,6 +286,7 @@ def generate_video_clip(
         audio_sample_rate=sample_rate,
         context_frames=12, fps=fps,
         context_overlap=3, start_idx=0,
+        audio_margin=audio_margin,  # NEW: Audio context margin
         init_latents=init_latent if use_init_latent else None,  # NEW: Conditional continuity
     )
     video = result.videos
@@ -318,7 +320,7 @@ def video_generation_thread(
     audio_queue, raw_clip_queue, stop_event,
     sample_rate=16000, fps=24, clip_frames=12,
     W=512, H=512, steps=4, cfg=1.0,
-    vad_threshold=0.005, use_init_latent=True,  # NEW: Toggle flag
+    vad_threshold=0.005, use_init_latent=True, audio_margin=2,  # NEW: Parameters
 ):
     """Diffusion-only thread: audio → pipeline → raw_clip_queue.
 
@@ -393,8 +395,9 @@ def video_generation_thread(
             video_np, final_latent = generate_video_clip(
                 pipe, ref_image, tmp_wav_path, poses_tensor,
                 W, H, clip_frames, sample_rate, fps, steps, cfg,
-                init_latent=last_latent,  # NEW: Use previous clip's final latent
-                use_init_latent=use_init_latent,  # NEW: Toggle flag
+                init_latent=last_latent,
+                use_init_latent=use_init_latent,
+                audio_margin=audio_margin,  # NEW: Audio context
             )
             if use_init_latent:
                 last_latent = final_latent  # NEW: Save for next clip
@@ -483,7 +486,8 @@ async def run_server(pipe, ref_image, pose_dir, pose_files, args):
         ),
         kwargs={
             "vad_threshold": args.vad_threshold,
-            "use_init_latent": args.use_init_latent,  # NEW: Pass flag
+            "use_init_latent": args.use_init_latent,
+            "audio_margin": args.audio_margin,  # NEW: Pass audio margin
         },
         daemon=True,
     )
@@ -604,6 +608,8 @@ def main():
     parser.add_argument("--use-init-latent", action=argparse.BooleanOptionalAction, default=True,
                         help="Enable latent state preservation for continuity between clips. "
                              "Use --no-use-init-latent to disable (old behavior).")
+    parser.add_argument("--audio-margin", type=int, default=2,
+                        help="Audio feature context margin (frames). Higher = more context for lip sync.")
     args = parser.parse_args()
 
     setup_logging()

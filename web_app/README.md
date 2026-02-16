@@ -95,6 +95,7 @@ Then open **http://localhost:8080** in your browser.
 | `--vad-threshold` | `0.005` | Server-side silence threshold (RMS). Clips below this are discarded. Set to `0.0` to disable. |
 | `--use-init-latent` | `True` | **Enable latent state preservation** for smooth pose continuity between clips |
 | `--no-use-init-latent` | N/A | Disable continuity (old behavior: each clip starts from random noise) |
+| `--audio-margin` | `2` | Audio feature context margin (frames). Increase to 4-6 to improve lip sync context without adding latency. |
 
 ## Features
 
