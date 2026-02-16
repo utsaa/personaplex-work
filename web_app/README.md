@@ -2,10 +2,18 @@
 
 Browser-based real-time face animation powered by the EchoMimic-v2 accelerated diffusion pipeline. Streams mic audio from the browser via WebSocket, runs it through the GPU pipeline, and streams back synchronised video frames + audio for playback.
 
+**Now Optimized with:**
+- **Reference Caching**: drastically reduces latency by pre-computing reference image features.
+- **Rolling Audio Buffer**: 1.5s context window for superior lip-sync accuracy.
+- **Flash Attention**: Automatically enabled for supported GPUs (RTX 3090/4090+).
+- **Latent State Preservation**: Smooth continuity between clips.
+
 ## Architecture
 
 ```
 Browser ──(WS: float32 PCM @ 16 kHz)──► Server ──► video_generation_thread
+                                                       │
+                                                       ▼
 Browser ◄──(WS: 0x01+JPEG / 0x02+PCM)── Server ◄── frame_queue / audio_out_queue
 ```
 
@@ -16,8 +24,9 @@ Browser ◄──(WS: 0x01+JPEG / 0x02+PCM)── Server ◄── frame_queue /
 
 - Python 3.10+
 - [uv](https://docs.astral.sh/uv/) (recommended) or pip
-- CUDA GPU (fp16 inference) — falls back to CPU but fp16 is not supported there
+- CUDA GPU (fp16 inference) — **RTX 3090/4090 Recommended**
 - The `echomimic_v2/` directory as a sibling folder containing the pipeline code and pretrained weights
+- **Optional (but recommended):** `xformers` for Flash Attention memory efficiency (`pip install xformers`)
 
 Expected directory layout:
 
@@ -62,20 +71,29 @@ python -m web_app.app --port 8080
 
 Then open **http://localhost:8080** in your browser.
 
-## RunPod Deployment
+## Optimization Features (New)
 
-1. Create a GPU pod and expose **HTTP port 8080**
-2. SSH into the pod:
-   ```bash
-   cd /workspace
-   # upload/clone echomimic_v2/ and web_app/ as siblings
-   cd web_app && uv sync
-   uv run python -m web_app.app --port 8080
-   ```
-3. Open the RunPod proxy URL in your browser:
-   ```
-   https://<POD_ID>-8080.proxy.runpod.net
-   ```
+These features are **enabled by default** to provide real-time performance and high-quality lip-sycn.
+
+### 1. Reference Caching (Latency Fix)
+- **What it does:** Pre-computes the Reference U-Net features and Self-Attention control keys *once* when the server starts.
+- **Benefit:** Removes the massive overhead of encoding the reference image for every single 0.5s clip.
+- **Log Output:** You will see `[INIT] Caching reference UNet states...` at startup.
+
+### 2. Rolling Audio Buffer (Lip-Sync Fix)
+- **What it does:** Instead of feeding raw 0.5s audio chunks to Whisper (which confuses it), we maintain a **1.5s rolling window** (1.0s history + 0.5s new audio).
+- **Benefit:** Whisper gets enough context to accurately predict mouth shapes, while the pipeline intelligently trims the output to only generate video for the new 0.5s.
+- **Log Output:** `[GEN] Audio Context: Rolling 1.5s window`
+
+### 3. Flash Attention (Hardware Speedup)
+- **What it does:** Uses `xformers` memory efficient attention.
+- **Benefit:** Reduces VRAM usage and speeds up the denoising loop on modern GPUs.
+- **Log Output:** `[INIT] Enabling xformers memory efficient attention...`
+
+### 4. Latent State Preservation (Continuity)
+- **What it does:** Uses the final latent of clip N to initialize clip N+1.
+- **Benefit:** Prevents the character from "resetting" to a neutral pose every 0.5s.
+- **Log Output:** `[CONTINUITY] Initializing first frame from previous clip's final latent`
 
 ## CLI Options
 
@@ -94,51 +112,14 @@ Then open **http://localhost:8080** in your browser.
 | `--port` | `8080` | HTTP server port |
 | `--vad-threshold` | `0.005` | Server-side silence threshold (RMS). Clips below this are discarded. Set to `0.0` to disable. |
 | `--use-init-latent` | `True` | **Enable latent state preservation** for smooth pose continuity between clips |
-| `--no-use-init-latent` | N/A | Disable continuity (old behavior: each clip starts from random noise) |
-| `--audio-margin` | `2` | Audio feature context margin (frames). Increase to 4-6 to improve lip sync context without adding latency. |
-
-## Features
-
-### Latent State Preservation (Continuity)
-
-**Enabled by default** — ensures smooth pose transitions between consecutive video clips.
-
-**How it works:**
-- Each video clip is generated in 0.5s segments (12 frames at 24 FPS)
-- The final latent state from clip N is used to initialize the first frame of clip N+1
-- This eliminates the "reset to idle pose" issue where the character would jump back to a neutral position every 0.5 seconds
-
-**Usage:**
-
-```bash
-# NEW BEHAVIOR (default): Smooth continuity
-uv run python -m web_app.app --port 8080
-
-# OLD BEHAVIOR: Discontinuous (for comparison)
-uv run python -m web_app.app --port 8080 --no-use-init-latent
-```
-
-**Visual difference:**
-- **With continuity (--use-init-latent):** Natural, flowing motion across clip boundaries
-- **Without continuity (--no-use-init-latent):** Character "resets" to idle pose every 0.5s
-
-Console output will show:
-```
-[CONTINUITY] Latent state preservation ENABLED    # with --use-init-latent (default)
-[CONTINUITY] Latent state preservation DISABLED (old behavior)  # with --no-use-init-latent
-```
-
-After the second clip onwards, you'll see:
-```
-[CONTINUITY] Initializing first frame from previous clip's final latent
-```
+| `--audio-margin` | `2` | Audio feature context margin (frames). |
 
 ## Development
 
 The key implementation files are:
 
 - **[app.py](app.py)** — WebSocket server, generation threads, and continuity logic
-- **[../echomimic_v2/src/pipelines/pipeline_echomimicv2_acc.py](../echomimic_v2/src/pipelines/pipeline_echomimicv2_acc.py)** — Modified pipeline with `init_latents` parameter and `final_latent` output
+- **[../echomimic_v2/src/pipelines/pipeline_echomimicv2_acc.py](../echomimic_v2/src/pipelines/pipeline_echomimicv2_acc.py)** — Modified pipeline with `encode_reference` caching, `audio_context_frames` trimming, and `final_latent` output.
 - **[index.html](index.html)** — Browser UI with Web Audio API for microphone streaming
 
 ## Logs

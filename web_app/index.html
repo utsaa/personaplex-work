@@ -91,7 +91,7 @@
     // Frame buffer: accumulate frames and play back at a steady FPS
     // ---------------------------------------------------------------------------
     const TARGET_FPS = 24;
-    const MIN_BUFFER = 12;        // start playback after this many frames buffered
+    const MIN_BUFFER = 3;        // start playback after this many frames buffered
     const MAX_BUFFER = 200;       // discard oldest if buffer grows beyond this
     let frameBuffer = [];         // array of blob URLs (JPEG)
     let playbackTimer = null;     // setInterval id

@@ -40,6 +40,7 @@ if _ECHOMIMIC_DIR not in sys.path:
     sys.path.insert(0, _ECHOMIMIC_DIR)
 
 from diffusers import AutoencoderKL, DDIMScheduler
+from diffusers.utils import is_accelerate_available
 from src.models.unet_2d_condition import UNet2DConditionModel
 from src.models.unet_3d_emo import EMOUNet3DConditionModel
 from src.models.whisper.audio2feature import load_audio_model
@@ -192,6 +193,15 @@ def load_pipeline(config_path: str, device: str, weight_dtype: torch.dtype) -> E
         scheduler=scheduler,
     )
     pipe = pipe.to(device, dtype=weight_dtype)
+
+    # NEW: Enable Flash Attention / Xformers if available
+    if is_accelerate_available():
+        print("[INIT] Enabling xformers memory efficient attention (Flash Attention)...")
+        try:
+            pipe.enable_xformers_memory_efficient_attention()
+        except Exception as e:
+            print(f"[WARN] Failed to enable xformers: {e}")
+    
     print("[READY] Pipeline loaded.\n")
     return pipe
 
@@ -246,6 +256,8 @@ def generate_video_clip(
     W, H, clip_frames, sample_rate, fps,
     steps=4, cfg=1.0, init_latent=None, use_init_latent=True,
     audio_margin=2,  # NEW: Audio context margin
+    reference_cache=None,  # NEW: Cached reference states
+    audio_context_frames=0,  # NEW: Rolling audio context
 ) -> tuple[np.ndarray | None, torch.Tensor | None]:
     """Generate a video clip and return both video frames and final latent.
     
@@ -278,6 +290,7 @@ def generate_video_clip(
             - final_latent: Latent tensor of the last frame for use in next clip
     """
     generator = torch.manual_seed(random.randint(0, 2**32 - 1))
+    # Pipeline run with caching and audio context
     result = pipe(
         ref_image, wav_path,
         poses_tensor[:, :, :clip_frames, ...],
@@ -286,8 +299,10 @@ def generate_video_clip(
         audio_sample_rate=sample_rate,
         context_frames=12, fps=fps,
         context_overlap=3, start_idx=0,
-        audio_margin=audio_margin,  # NEW: Audio context margin
-        init_latents=init_latent if use_init_latent else None,  # NEW: Conditional continuity
+        audio_margin=audio_margin, 
+        init_latents=init_latent if use_init_latent else None,
+        reference_cache=reference_cache,  # NEW: Pass cache
+        audio_context_frames=audio_context_frames,  # NEW: Pass context frames to trim
     )
     video = result.videos
     final_latent = result.final_latent  # NEW: Extract for next clip
@@ -318,60 +333,78 @@ def _rms(audio: np.ndarray) -> float:
 def video_generation_thread(
     pipe, ref_image, pose_dir, pose_files,
     audio_queue, raw_clip_queue, stop_event,
+    reference_cache,  # NEW: Receive cached reference states
     sample_rate=16000, fps=24, clip_frames=12,
     W=512, H=512, steps=4, cfg=1.0,
-    vad_threshold=0.005, use_init_latent=True, audio_margin=2,  # NEW: Parameters
+    vad_threshold=0.005, use_init_latent=True, audio_margin=2,
 ):
     """Diffusion-only thread: audio → pipeline → raw_clip_queue.
-
-    Continuously processes audio chunks from audio_queue, runs them through
-    the EchoMimic-v2 diffusion pipeline, and outputs raw video tensors to
-    raw_clip_queue for post-processing.
-    
-    Key features:
-    - VAD (Voice Activity Detection) filtering based on RMS threshold
-    - Optional latent state preservation for smooth clip-to-clip continuity
-    - Hands off raw outputs immediately to avoid blocking next clip generation
-    
-    Args:
-        use_init_latent: If True, preserve latent state across clips for continuity.
-                        If False, each clip starts from independent random noise.
     """
     samples_per_clip = int(sample_rate * clip_frames / fps)
-    audio_buffer = np.array([], dtype=np.float32)
-    pose_idx = 0
-    last_latent = None  # NEW: Track last frame's latent for continuity
+    
+    # NEW: Audio Context Buffer
+    # We want 1.0s of history + 0.5s of new audio = 1.5s total window
+    history_samples = sample_rate * 1  # 1.0s history
+    # The buffer will hold [history] + [current_clip_accumulation]
+    audio_history_buffer = np.zeros(history_samples, dtype=np.float32)
+    
+    # Accumulation buffer for the *next* clip
+    incoming_audio_buffer = np.array([], dtype=np.float32)
 
-    print(f"[GEN] Waiting for audio (need {samples_per_clip} samples = "
-          f"{clip_frames/fps:.2f}s per clip) ...")
-    print(f"[GEN] Server-side VAD threshold: {vad_threshold:.4f} "
-          f"{'enabled' if vad_threshold > 0 else 'disabled'}")
-    if use_init_latent:
-        print(f"[CONTINUITY] Latent state preservation ENABLED")
-    else:
-        print(f"[CONTINUITY] Latent state preservation DISABLED (old behavior)")
+    pose_idx = 0
+    last_latent = None 
+
+    print(f"[GEN] Waiting for audio (target clip: {samples_per_clip} samples) ...")
+    print(f"[GEN] Audio Context: Rolling 1.5s window (1.0s history + 0.5s new)")
 
     while not stop_event.is_set():
-        # Drain audio_queue into buffer
+        # Drain audio_queue into incoming buffer
         try:
             while True:
                 chunk = audio_queue.get(timeout=0.05)
-                audio_buffer = np.concatenate((audio_buffer, chunk))
+                incoming_audio_buffer = np.concatenate((incoming_audio_buffer, chunk))
         except queue.Empty:
             pass
 
-        if len(audio_buffer) < samples_per_clip:
+        # Check if we have enough "new" audio for a clip
+        if len(incoming_audio_buffer) < samples_per_clip:
             continue
 
-        clip_audio = audio_buffer[:samples_per_clip]
-        audio_buffer = audio_buffer[samples_per_clip:]
+        # Extract the exact 0.5s clip
+        current_clip_audio = incoming_audio_buffer[:samples_per_clip]
+        incoming_audio_buffer = incoming_audio_buffer[samples_per_clip:]
 
-        # --- Server-side silence gate (layers 2 & 3) -----------------------
-        clip_rms = _rms(clip_audio)
+        # --- Server-side silence gate (on new audio only) ------------------
+        clip_rms = _rms(current_clip_audio)
         if vad_threshold > 0 and clip_rms < vad_threshold:
             print(f"[GEN] Silent clip discarded (RMS={clip_rms:.5f} < {vad_threshold:.4f})")
+            # Even if discarded, we might want to update history? 
+            # Ideally yes, silence is also context.
+            # Shift history buffer
+            audio_history_buffer = np.concatenate((audio_history_buffer, current_clip_audio))[-history_samples:]
+            # Reset continuity if silence is long? For now, keep simple.
+            # last_latent = None # Optional: reset latent on silence
             continue
         # -------------------------------------------------------------------
+
+        # Prepare the full 1.5s window for Whisper
+        # window = [history (1.0s)] + [current (0.5s)]
+        full_audio_window = np.concatenate((audio_history_buffer, current_clip_audio))
+        
+        # Calculate how many audio frames correspond to the history (to tell pipeline to skip them)
+        # Whisper (tiny) typically outputs 50 frames per second. 
+        # But we pass `audio_context_frames` to the pipeline, which iterates over `whisper_chunks`.
+        # `whisper_chunks` size depends on fps.
+        # Logic: output video frames = clip_frames. 
+        # The pipeline aligns audio chunks to video frames. 
+        # If we pass 1.5s of audio, we get ~36 video frames worth of audio features.
+        # We want to skip the first ~24 frames (1.0s) and generate the last 12 frames (0.5s).
+        # Precise calculation: 
+        # context_duration = len(audio_history_buffer) / sample_rate
+        # context_video_frames = int(context_duration * fps)
+        
+        context_duration = len(audio_history_buffer) / sample_rate
+        context_video_frames = int(context_duration * fps)
 
         tmp_wav_path = None
         try:
@@ -381,7 +414,7 @@ def video_generation_thread(
                 wf.setnchannels(1)
                 wf.setsampwidth(2)
                 wf.setframerate(sample_rate)
-                pcm_int16 = np.clip(clip_audio * 32767, -32768, 32767).astype(np.int16)
+                pcm_int16 = np.clip(full_audio_window * 32767, -32768, 32767).astype(np.int16)
                 wf.writeframes(pcm_int16.tobytes())
 
             poses_tensor = prepare_pose_tensor(
@@ -391,24 +424,29 @@ def video_generation_thread(
             pose_idx = (pose_idx + clip_frames) % len(pose_files)
 
             t0 = time.perf_counter()
-            # NEW: Pass and receive latent state for continuity
+            # Generate
             video_np, final_latent = generate_video_clip(
                 pipe, ref_image, tmp_wav_path, poses_tensor,
                 W, H, clip_frames, sample_rate, fps, steps, cfg,
                 init_latent=last_latent,
                 use_init_latent=use_init_latent,
-                audio_margin=audio_margin,  # NEW: Audio context
+                audio_margin=audio_margin,
+                reference_cache=reference_cache, # NEW
+                audio_context_frames=context_video_frames, # NEW
             )
             if use_init_latent:
-                last_latent = final_latent  # NEW: Save for next clip
+                last_latent = final_latent 
             
             dt = time.perf_counter() - t0
             print(f"[GEN] Clip generated in {dt:.2f}s "
-                  f"({clip_frames} frames, {clip_frames/fps:.2f}s of video)")
+                  f"({clip_frames} frames). Context: {context_video_frames} frames skipped.")
 
-            # Hand off raw output immediately — don't block on post-processing
+            # Append current clip to history (rolling buffer)
+            audio_history_buffer = np.concatenate((audio_history_buffer, current_clip_audio))[-history_samples:]
+
+            # Hand off raw output
             if video_np is not None:
-                raw_clip_queue.put((video_np, clip_audio.copy()))
+                raw_clip_queue.put((video_np, current_clip_audio.copy())) # Send ONLY new audio
 
         except Exception as e:
             print(f"[GEN] Error: {e}")
@@ -422,7 +460,7 @@ def video_generation_thread(
 
 
 def postprocess_thread(
-    raw_clip_queue, frame_queue, audio_out_queue, stop_event,
+    raw_clip_queue, socket_queue, stop_event,
 ):
     """Convert raw video tensors to BGR frames and push to delivery queues.
 
@@ -438,14 +476,18 @@ def postprocess_thread(
 
         t0 = time.perf_counter()
 
-        # Push audio for this clip
-        if audio_out_queue is not None:
+        # 1. Push audio for this clip (Priority 1)
+        # We send audio FIRST so the client can schedule it immediately.
+        if socket_queue is not None:
             try:
-                audio_out_queue.put_nowait(clip_audio)
+                # Prefix 0x02 = Audio
+                msg = b'\x02' + clip_audio.tobytes()
+                socket_queue.put(msg, timeout=0.1)
             except queue.Full:
+                print("[POST] Socket queue full (dropping audio!)")
                 pass
 
-        # Convert and push each frame
+        # 2. Convert and push each frame (Priority 2)
         n_frames = video_np.shape[2]
         for f_idx in range(n_frames):
             if stop_event.is_set():
@@ -454,13 +496,21 @@ def postprocess_thread(
             frame = (frame * 255).clip(0, 255).astype(np.uint8)
             frame = frame.transpose(1, 2, 0)
             frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+            
+            # Encode JPEG
+            _, jpeg = cv2.imencode(".jpg", frame_bgr, [cv2.IMWRITE_JPEG_QUALITY, 85])
+            
             try:
-                frame_queue.put_nowait(frame_bgr)
+                # Prefix 0x01 = Video
+                msg = b'\x01' + jpeg.tobytes()
+                socket_queue.put(msg, timeout=0.1)
             except queue.Full:
+                # Dropping frames is better than blocking generation
+                print("[POST] Socket queue full (dropping frame)")
                 pass
 
         dt = time.perf_counter() - t0
-        print(f"[POST] {n_frames} frames post-processed in {dt*1000:.1f}ms")
+        print(f"[POST] {n_frames} frames post-processed & scheduled in {dt*1000:.1f}ms")
 
 
 # ---------------------------------------------------------------------------
@@ -470,10 +520,17 @@ def postprocess_thread(
 async def run_server(pipe, ref_image, pose_dir, pose_files, args):
     from aiohttp import web
 
+    # NEW: Encode reference once at startup
+    print(f"[INIT] Caching reference UNet states...")
+    reference_cache = pipe.encode_reference(
+        ref_image, args.width, args.height, args.steps, args.cfg,
+        dtype=pipe.dtype, device=pipe.device
+    )
+    print(f"[INIT] Reference cached.")
+
     audio_queue = queue.Queue()
-    raw_clip_queue = queue.Queue(maxsize=4)  # buffer up to 4 raw clips
-    frame_queue = queue.Queue(maxsize=200)
-    audio_out_queue = queue.Queue(maxsize=50)
+    raw_clip_queue = queue.Queue(maxsize=4)
+    socket_queue = queue.Queue(maxsize=200)
     stop_event = threading.Event()
 
     gen_thread = threading.Thread(
@@ -481,13 +538,14 @@ async def run_server(pipe, ref_image, pose_dir, pose_files, args):
         args=(
             pipe, ref_image, pose_dir, pose_files,
             audio_queue, raw_clip_queue, stop_event,
+            reference_cache,
             args.sample_rate, args.fps, args.clip_frames,
             args.width, args.height, args.steps, args.cfg,
         ),
         kwargs={
             "vad_threshold": args.vad_threshold,
             "use_init_latent": args.use_init_latent,
-            "audio_margin": args.audio_margin,  # NEW: Pass audio margin
+            "audio_margin": args.audio_margin,  
         },
         daemon=True,
     )
@@ -495,7 +553,7 @@ async def run_server(pipe, ref_image, pose_dir, pose_files, args):
 
     post_thread = threading.Thread(
         target=postprocess_thread,
-        args=(raw_clip_queue, frame_queue, audio_out_queue, stop_event),
+        args=(raw_clip_queue, socket_queue, stop_event),
         daemon=True,
     )
     post_thread.start()
@@ -518,26 +576,13 @@ async def run_server(pipe, ref_image, pose_dir, pose_files, args):
             frame_interval = 1.0 / fps
             while not ws.closed and not stop_event.is_set():
                 try:
-                    sent = False
                     try:
-                        audio_clip = audio_out_queue.get_nowait()
-                        await ws.send_bytes(b'\x02' + audio_clip.tobytes())
-                        sent = True
+                        # Get pre-formatted bytes (audio or jpeg) from single queue
+                        # This enforces sequential sending order (Audio -> Frames -> Audio -> Frames)
+                        data = socket_queue.get(timeout=0.01)
+                        await ws.send_bytes(data)
+                        # Don't sleep if we have data, to clear backlog
                     except queue.Empty:
-                        pass
-
-                    try:
-                        frame_bgr = frame_queue.get_nowait()
-                        _, jpeg = cv2.imencode(
-                            ".jpg", frame_bgr,
-                            [cv2.IMWRITE_JPEG_QUALITY, 85],
-                        )
-                        await ws.send_bytes(b'\x01' + jpeg.tobytes())
-                        sent = True
-                    except queue.Empty:
-                        pass
-
-                    if not sent:
                         await asyncio.sleep(frame_interval)
                 except (ConnectionResetError, ConnectionError):
                     break
@@ -568,8 +613,8 @@ async def run_server(pipe, ref_image, pose_dir, pose_files, args):
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", args.port)
     await site.start()
-    print(f"[WEB] Server running at http://0.0.0.0:{args.port}")
-    print(f"[WEB] Open http://localhost:{args.port} in your browser.\n")
+    print(f"[WEB] Server running at http://0.0.0.0:{args.port} (IPv4)")
+    print(f"[WEB] Open http://127.0.0.1:{args.port} in your browser.\n")
 
     try:
         while not stop_event.is_set():

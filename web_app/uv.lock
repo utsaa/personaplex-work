@@ -1843,6 +1843,7 @@ dependencies = [
     { name = "tqdm", marker = "(platform_machine == 'x86_64' and sys_platform == 'linux') or sys_platform == 'win32'" },
     { name = "transformers", marker = "(platform_machine == 'x86_64' and sys_platform == 'linux') or sys_platform == 'win32'" },
     { name = "whisperx", marker = "(platform_machine == 'x86_64' and sys_platform == 'linux') or sys_platform == 'win32'" },
+    { name = "xformers", marker = "(platform_machine == 'x86_64' and sys_platform == 'linux') or sys_platform == 'win32'" },
 ]
 
 [package.metadata]
@@ -1868,6 +1869,7 @@ requires-dist = [
     { name = "tqdm" },
     { name = "transformers", specifier = ">=4.46.0" },
     { name = "whisperx", specifier = "==3.7.4" },
+    { name = "xformers", specifier = ">=0.0.32.post2" },
 ]
 provides-extras = ["blackwell"]
 
@@ -1892,6 +1894,20 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/7d/2f/7b304c50a84891bd2cec16fb4695f7cbd0860065ce3018d3de08ebad4ddb/whisperx-3.7.4.tar.gz", hash = "sha256:e0075a7b7902859be5261b29ac223dbf1d044688ddc692850726e813fd319f8c", size = 16488015, upload-time = "2025-10-16T07:43:11.804Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/2e/3d/080f90280f217f2e9ca3a3d7576fbb3fd0ac6634452cda77658b0e490820/whisperx-3.7.4-py3-none-any.whl", hash = "sha256:79317183dbc39e8542956dec2a6c2cf2bfb466a14301ca9d1f3e200eda40837a", size = 16485207, upload-time = "2025-10-16T07:43:08.229Z" },
+]
+
+[[package]]
+name = "xformers"
+version = "0.0.32.post2"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "numpy", marker = "(platform_machine == 'x86_64' and sys_platform == 'linux') or sys_platform == 'win32'" },
+    { name = "torch", marker = "(platform_machine == 'x86_64' and sys_platform == 'linux') or sys_platform == 'win32'" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/47/99/68d2e7a17b65a08180d6b120d1d293d5855a0c5999cb30a79fb466b49642/xformers-0.0.32.post2.tar.gz", hash = "sha256:9538be803969c6e1ca16a3ece921e472c24f79970b10be1087a389dcb66e412a", size = 12105990, upload-time = "2025-08-15T11:48:56.584Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/ce/16/4ed2fbf7c20ba20565d9a1fc544c2bef39d409c8eca1949654c6ff9f8452/xformers-0.0.32.post2-cp39-abi3-manylinux_2_28_x86_64.whl", hash = "sha256:3d1fefe0006eb00a730b3b197ff41aab085f1209b50419baab6152445f09e508", size = 117196673, upload-time = "2025-08-15T11:48:46.726Z" },
+    { url = "https://files.pythonhosted.org/packages/50/19/ea64609a535f87a44cb177dc37c6d6a58f6d540adfff819d565fb0657cf7/xformers-0.0.32.post2-cp39-abi3-win_amd64.whl", hash = "sha256:87fa13f4b406ed640554cea6687d0020b496bd6b446ca17d24f9438a079e6f09", size = 100221079, upload-time = "2025-08-15T11:48:53.234Z" },
 ]
 
 [[package]]
