@@ -91,7 +91,7 @@
     // Frame buffer: accumulate frames and play back at a steady FPS
     // ---------------------------------------------------------------------------
     const TARGET_FPS = 24;
-    const MIN_BUFFER = 3;        // start playback after this many frames buffered
+    const MIN_BUFFER = 12;        // start playback after one full clip (12 frames at 24fps = 0.5s)
     const MAX_BUFFER = 200;       // discard oldest if buffer grows beyond this
     let frameBuffer = [];         // array of blob URLs (JPEG)
     let playbackTimer = null;     // setInterval id
@@ -164,17 +164,14 @@
               const indicator = document.getElementById('vad-indicator');
 
               if (rms >= VAD_RMS_THRESHOLD) {
-                // Speech detected – send and reset hold counter
                 vadHoldCounter = VAD_HOLD_CHUNKS;
                 ws.send(new Float32Array(pcm).buffer);
                 if (indicator) { indicator.textContent = 'VAD: speaking \u{1F50A}'; indicator.style.color = '#0f0'; }
               } else if (vadHoldCounter > 0) {
-                // Tail – keep sending briefly after speech ends
                 vadHoldCounter--;
                 ws.send(new Float32Array(pcm).buffer);
                 if (indicator) { indicator.textContent = 'VAD: tail...'; indicator.style.color = '#aa0'; }
               } else {
-                // Silence – do NOT send
                 if (indicator) { indicator.textContent = 'VAD: silent'; indicator.style.color = '#555'; }
               }
             }
@@ -260,6 +257,7 @@
       document.getElementById('stopBtn').disabled = true;
     }
   </script>
+
 </body>
 
 </html>

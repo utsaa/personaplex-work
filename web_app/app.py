@@ -370,13 +370,17 @@ def video_generation_thread(
         except queue.Empty:
             pass
 
-        # 1. Backlog Catch-up: if we are > 1.5s behind, skip old audio to stay live
-        if len(incoming_audio_buffer) > (samples_per_clip * 3):
-            dropped_count = len(incoming_audio_buffer) - samples_per_clip
-            print(f"[GEN] Backlog detected! Dropping {dropped_count} samples ({dropped_count/sample_rate:.2f}s) to keep up.")
-            incoming_audio_buffer = incoming_audio_buffer[-samples_per_clip:]
+        # No backlog dropping — process clips sequentially from the FIFO.
+        # Generation takes ~3s per 0.5s clip (6:1 ratio), so the system
+        # runs a few seconds behind real-time. This is acceptable because:
+        #   - Every word is faithfully generated (no skipped audio)
+        #   - Audio + Video arrive in sync at the client
+        #   - Dropping audio always produces garbage (silent tails) or gaps
+        #
+        # If the user stops speaking, the pipeline will naturally catch up
+        # as the generation thread processes remaining buffered audio.
 
-        # Check if we have enough "new" audio for a clip
+        # Check if we have enough audio for a clip
         if len(incoming_audio_buffer) < samples_per_clip:
             continue
 
@@ -483,12 +487,15 @@ def video_generation_thread(
 
 
 def postprocess_thread(
-    raw_clip_queue, socket_queue, stop_event,
+    raw_clip_queue, audio_out_queue, frame_queue, stop_event,
 ):
-    """Convert raw video tensors to BGR frames and push to delivery queues.
+    """Convert raw video tensors to pre-encoded JPEG frames and push to 
+    separate audio and video queues.
 
-    Runs concurrently with the generation thread so that clip N+1's
-    diffusion overlaps with clip N's post-processing and WebSocket send.
+    Using SEPARATE queues is critical: audio must never be blocked by video
+    congestion.  The old unified socket_queue design caused deadlocks where
+    a full queue of video frames prevented audio from being enqueued,
+    stalling the entire pipeline.
     """
     print("[POST] Post-processing thread started.")
     while not stop_event.is_set():
@@ -499,18 +506,21 @@ def postprocess_thread(
 
         t0 = time.perf_counter()
 
-        # 1. Push audio for this clip (Priority 1)
-        # We send audio FIRST so the client can schedule it immediately.
-        if socket_queue is not None:
+        # 1. Push audio FIRST — never block, never drop
+        #    Pre-encode with 0x02 tag so send_frames can just forward bytes.
+        audio_msg = b'\x02' + clip_audio.tobytes()
+        try:
+            audio_out_queue.put_nowait(audio_msg)
+        except queue.Full:
+            # This should rarely happen (audio queue is small & fast to drain).
+            # If it does, force-put by discarding oldest.
             try:
-                # Prefix 0x02 = Audio
-                msg = b'\x02' + clip_audio.tobytes()
-                socket_queue.put(msg, timeout=0.1)
-            except queue.Full:
-                print("[POST] Socket queue full (dropping audio!)")
+                audio_out_queue.get_nowait()
+            except queue.Empty:
                 pass
+            audio_out_queue.put_nowait(audio_msg)
 
-        # 2. Convert and push each frame (Priority 2)
+        # 2. Convert and push each frame (droppable)
         n_frames = video_np.shape[2]
         for f_idx in range(n_frames):
             if stop_event.is_set():
@@ -519,21 +529,19 @@ def postprocess_thread(
             frame = (frame * 255).clip(0, 255).astype(np.uint8)
             frame = frame.transpose(1, 2, 0)
             frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-            
-            # Encode JPEG
+
+            # Encode JPEG in this background thread (not on event loop)
             _, jpeg = cv2.imencode(".jpg", frame_bgr, [cv2.IMWRITE_JPEG_QUALITY, 85])
-            
+            frame_msg = b'\x01' + jpeg.tobytes()
+
             try:
-                # Prefix 0x01 = Video
-                msg = b'\x01' + jpeg.tobytes()
-                socket_queue.put(msg, timeout=0.1)
+                frame_queue.put_nowait(frame_msg)
             except queue.Full:
-                # Dropping frames is better than blocking generation
-                print("[POST] Socket queue full (dropping frame)")
+                # Dropping frames is acceptable — audio keeps flowing
                 pass
 
         dt = time.perf_counter() - t0
-        print(f"[POST] {n_frames} frames post-processed & scheduled in {dt*1000:.1f}ms")
+        print(f"[POST] {n_frames} frames post-processed in {dt*1000:.1f}ms")
 
 
 # ---------------------------------------------------------------------------
@@ -553,7 +561,8 @@ async def run_server(pipe, ref_image, pose_dir, pose_files, args):
 
     audio_queue = queue.Queue()
     raw_clip_queue = queue.Queue(maxsize=4)
-    socket_queue = queue.Queue(maxsize=300)
+    audio_out_queue = queue.Queue(maxsize=50)   # pre-encoded audio clips
+    frame_queue = queue.Queue(maxsize=300)      # pre-encoded JPEG frames
     stop_event = threading.Event()
 
     gen_thread = threading.Thread(
@@ -576,7 +585,7 @@ async def run_server(pipe, ref_image, pose_dir, pose_files, args):
 
     post_thread = threading.Thread(
         target=postprocess_thread,
-        args=(raw_clip_queue, socket_queue, stop_event),
+        args=(raw_clip_queue, audio_out_queue, frame_queue, stop_event),
         daemon=True,
     )
     post_thread.start()
@@ -606,13 +615,27 @@ async def run_server(pipe, ref_image, pose_dir, pose_files, args):
             frame_interval = 1.0 / fps
             while not ws.closed and not stop_event.is_set():
                 try:
-                    try:
-                        # Get pre-formatted bytes (audio or jpeg) from single queue
-                        # This enforces sequential sending order (Audio -> Frames -> Audio -> Frames)
-                        data = socket_queue.get(timeout=0.01)
-                        await ws.send_bytes(data)
-                        # Don't sleep if we have data, to clear backlog
-                    except queue.Empty:
+                    sent_any = False
+
+                    # Priority 1: drain ALL pending audio
+                    while True:
+                        try:
+                            audio_data = audio_out_queue.get_nowait()
+                            await ws.send_bytes(audio_data)
+                            sent_any = True
+                        except queue.Empty:
+                            break
+
+                    # Priority 2: drain ALL pending video frames
+                    while True:
+                        try:
+                            frame_data = frame_queue.get_nowait()
+                            await ws.send_bytes(frame_data)
+                            sent_any = True
+                        except queue.Empty:
+                            break
+
+                    if not sent_any:
                         await asyncio.sleep(frame_interval)
                 except (ConnectionResetError, ConnectionError):
                     break

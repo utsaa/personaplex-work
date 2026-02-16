@@ -247,16 +247,18 @@ class EchoMimicV2Pipeline(DiffusionPipeline):
         
         latents = torch.clamp(latents_seg, -1.5, 1.5)
 
-        # NEW: Initialize first frame from previous clip's last frame if provided
-        if init_latents is not None:
-            print(f"[CONTINUITY] Initializing first frame from previous clip's final latent")
-            # init_latents shape: (batch, channels, height, width)
-            # We replace the first frame (index 0 in temporal dimension)
-            latents[:, :, 0, :, :] = init_latents.to(device=device, dtype=dtype)
-
-        # scale the initial noise by the standard deviation required by the scheduler
+        # Scale the initial noise by the standard deviation required by the scheduler
         latents = latents * self.scheduler.init_noise_sigma
-        print(f"latents shape:{latents.shape}, video_length:{video_length}")
+
+        # Initialize first frame from previous clip's last frame if provided.
+        # This is done AFTER noise scaling so the clean continuity signal
+        # isn't corrupted by the scheduler's init_noise_sigma multiplier.
+        if init_latents is not None:
+            blend = 0.6  # tunable: higher = stronger continuity, lower = more diffusion freedom
+            latents[:, :, 0, :, :] = (
+                blend * init_latents.to(device=device, dtype=dtype)
+                + (1 - blend) * latents[:, :, 0, :, :]
+            )
         
         return latents
 
@@ -442,14 +444,21 @@ class EchoMimicV2Pipeline(DiffusionPipeline):
         
         # Audio Context Trimming
         if audio_context_frames > 0:
-            # print(f"[DEBUG] Trimming audio context: {audio_context_frames} frames (orig: {whisper_chunks.shape[0]})")
             if audio_context_frames < whisper_chunks.shape[0]:
                 whisper_chunks = whisper_chunks[audio_context_frames:]
             else:
-                 # Fallback if audio is too short, though this shouldn't happen with correct buffering
                 print(f"[WARNING] Audio context frames {audio_context_frames} >= chunk length {whisper_chunks.shape[0]}, no trimming done.")
 
         audio_frame_num = whisper_chunks.shape[0]
+
+        # Guard: if trimming left fewer frames than requested video_length,
+        # pad by repeating the last frame to avoid shape mismatch with poses_tensor.
+        if audio_frame_num < video_length:
+            pad_count = video_length - audio_frame_num
+            pad = np.tile(whisper_chunks[-1:], (pad_count, 1))
+            whisper_chunks = np.concatenate([whisper_chunks, pad], axis=0)
+            audio_frame_num = whisper_chunks.shape[0]
+
         audio_fea_final = torch.Tensor(whisper_chunks).to(dtype=self.vae.dtype, device=self.vae.device)
         audio_fea_final = audio_fea_final.unsqueeze(0)
         
