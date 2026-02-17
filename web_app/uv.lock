@@ -1781,6 +1781,14 @@ wheels = [
 ]
 
 [[package]]
+name = "triton-windows"
+version = "3.6.0.post25"
+source = { registry = "https://pypi.org/simple" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/49/b8/2ce283452b0b9e0d239c7833626750befe94d5bbed18fb9449dcc5fa494e/triton_windows-3.6.0.post25-cp311-cp311-win_amd64.whl", hash = "sha256:5dabf103499825379c9ba877da46a4c34296466a628b539249482ab6d970708e", size = 47381466, upload-time = "2026-01-26T03:21:21.541Z" },
+]
+
+[[package]]
 name = "typer"
 version = "0.23.1"
 source = { registry = "https://pypi.org/simple" }
@@ -1848,6 +1856,7 @@ dependencies = [
     { name = "torchvision", marker = "(platform_machine == 'x86_64' and sys_platform == 'linux') or sys_platform == 'win32'" },
     { name = "tqdm", marker = "(platform_machine == 'x86_64' and sys_platform == 'linux') or sys_platform == 'win32'" },
     { name = "transformers", marker = "(platform_machine == 'x86_64' and sys_platform == 'linux') or sys_platform == 'win32'" },
+    { name = "triton-windows", marker = "sys_platform == 'win32'" },
     { name = "whisperx", marker = "(platform_machine == 'x86_64' and sys_platform == 'linux') or sys_platform == 'win32'" },
     { name = "xformers", marker = "(platform_machine == 'x86_64' and sys_platform == 'linux') or sys_platform == 'win32'" },
 ]
@@ -1875,6 +1884,7 @@ requires-dist = [
     { name = "torchvision", index = "https://download.pytorch.org/whl/cu126" },
     { name = "tqdm" },
     { name = "transformers", specifier = ">=4.46.0" },
+    { name = "triton-windows", marker = "sys_platform == 'win32'", specifier = "<3.7" },
     { name = "whisperx", specifier = "==3.7.4" },
     { name = "xformers", specifier = ">=0.0.32.post2" },
 ]

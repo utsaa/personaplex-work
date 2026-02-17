@@ -28,6 +28,7 @@ dependencies = [
     "torchaudio",
     "xformers>=0.0.32.post2",
     "torchao",
+    "triton-windows < 3.7; sys_platform == 'win32'"
 ]
 
 [project.optional-dependencies]
