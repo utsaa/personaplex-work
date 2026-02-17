@@ -961,7 +961,8 @@ def main():
              pipe.denoising_unet = torch.compile(
                  pipe.denoising_unet, 
                  mode=mode,
-                 backend="inductor"
+                 backend="inductor",
+                 fullgraph=True
              )
         except Exception as e:
              print(f"[WARN] Compilation failed: {e}. Fallback to eager mode.")
