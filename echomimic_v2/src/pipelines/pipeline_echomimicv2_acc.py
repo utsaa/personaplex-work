@@ -363,7 +363,7 @@ class EchoMimicV2Pipeline(DiffusionPipeline):
     def __call__(
         self,
         ref_image,
-        audio_path,
+        audio_data,
         poses_tensor,
         width,
         height,
@@ -439,8 +439,8 @@ class EchoMimicV2Pipeline(DiffusionPipeline):
         )
 
         # Audio Processing
-        whisper_feature = self.audio_guider.audio2feat(audio_path)
-        whisper_chunks = self.audio_guider.feature2chunks(feature_array=whisper_feature, fps=fps)
+        whisper_feature = self.audio_guider.audio2feat(audio_data)
+        whisper_chunks = self.audio_guider.feature2chunks(feature_array=whisper_feature, fps=fps, audio_feat_length=[audio_margin, audio_margin])
         
         # Audio Context Trimming
         if audio_context_frames > 0:
@@ -455,7 +455,7 @@ class EchoMimicV2Pipeline(DiffusionPipeline):
         # pad by repeating the last frame to avoid shape mismatch with poses_tensor.
         if audio_frame_num < video_length:
             pad_count = video_length - audio_frame_num
-            pad = np.tile(whisper_chunks[-1:], (pad_count, 1))
+            pad = np.repeat(whisper_chunks[-1:], pad_count, axis=0)
             whisper_chunks = np.concatenate([whisper_chunks, pad], axis=0)
             audio_frame_num = whisper_chunks.shape[0]
 

@@ -3,6 +3,7 @@ from .whisper import load_model
 import numpy as np
 import time
 import sys
+
 sys.path.append("..")
 
 class Audio2Feature():
@@ -95,9 +96,9 @@ class Audio2Feature():
 
         return np.array(whisper_chunks)
 
-    def audio2feat(self,audio_path):
-        # get the sample rate of the audio
-        result = self.model.transcribe(audio_path)
+    def audio2feat(self, audio_data):
+        # audio_data can be a file path (str) or a numpy array/torch tensor
+        result = self.model.transcribe(audio_data)
         embed_list = []
         for emb in result['segments']:
             encoder_embeddings = emb['encoder_embeddings']
@@ -107,11 +108,20 @@ class Audio2Feature():
             end_idx = int(emb['end'])
             emb_end_idx = int((end_idx - start_idx)/2)
             embed_list.append(encoder_embeddings[:emb_end_idx])
+        if not embed_list:
+             # Handle silence/empty result
+             return np.zeros((0, 384), dtype=np.float32)
         concatenated_array = np.concatenate(embed_list, axis=0)
         return concatenated_array
 
-def load_audio_model(model_path, device):
-    audio_processor = Audio2Feature(model_path=model_path, device=device)
+def load_audio_model(model_path, device, model_type="whisper", adapter_path=None):
+    if model_type == "whisper":
+        audio_processor = Audio2Feature(model_path=model_path, device=device)
+    elif model_type == "wav2vec2":
+        from .wav2vec_audio2feature import Wav2Vec2Audio2Feature
+        audio_processor = Wav2Vec2Audio2Feature(model_path=model_path, device=device, adapter_path=adapter_path)
+    else:
+        raise ValueError(f"Unknown audio model type: {model_type}")
     return audio_processor
 
 if __name__ == "__main__":

@@ -9,6 +9,7 @@ Browser-based real-time face animation powered by the EchoMimic-v2 accelerated d
 - **Rolling Audio Buffer**: 1.5s context window for superior lip-sync accuracy.
 - **Flash Attention**: Automatically enabled for supported GPUs (RTX 3090/4090+).
 - **Latent State Preservation**: Smooth continuity between clips.
+- **Wav2Vec2 Integration**: Alternative audio feature extractor for high-fidelity lip-sync.
 
 ## Architecture
 
@@ -29,6 +30,7 @@ Browser ◄──(WS: 0x01+JPEG / 0x02+PCM)── Server ◄── frame_queue /
 - CUDA GPU (fp16 inference) — **RTX 3090/4090 Recommended**
 - The `echomimic_v2/` directory as a sibling folder containing the pipeline code and pretrained weights
 - **Optional (but recommended):** `xformers` for Flash Attention (`pip install xformers`)
+- **Optional:** `transformers` & `librosa` for Wav2Vec2 support (`pip install transformers librosa`)
 
 Expected directory layout:
 
@@ -66,9 +68,14 @@ pip install -e .
   - `default`: Standard PyTorch compilation.
 - `--quantize-fp8`: Enables 8-bit weight quantization via `torchao`. Reduces VRAM and boosts speed on RTX 4090/H100.
 
-**Run Optimized (RTX 4090 Recommended):**
+**Run Optimized (Whisper + RTX 4090 Recommended):**
 ```bash
-uv run python app.py --port 8080 --compile-unet --compile-unet-mode reduce-overhead --quantize-fp8 --steps 4 --audio-margin 6 --use-init-latent
+uv run python app.py --port 8080 --compile-unet --compile-unet-mode reduce-overhead --quantize-fp8 --steps 4 --audio-margin 6 --use-init-latent --audio-model-type whisper
+```
+
+**Run for Wav2Vec2:**
+```bash
+uv run python app.py --port 8080 --audio-model-type wav2vec2 --steps 4 --audio-margin 6 --use-init-latent
 ```
 
 Then open **http://localhost:8080** in your browser.
@@ -106,6 +113,11 @@ The web app includes several advanced optimizations for low-latency, real-time p
 - **Benefit:** Prevents the character from "resetting" or flickering between clips.
 - **Flag:** `--use-init-latent`
 
+### 7. Low RAM Mode (Stability Fix)
+- **What it does:** Disables the pre-loading of pose sequences (`.npy` files) into system RAM. Instead, it reads them from disk on-the-fly during generation.
+- **Benefit:** Reduces system RAM footprint by ~1GB. Essential for systems with limited RAM or when running extremely long pose sequences.
+- **Flag:** `--low-ram`
+
 ## CLI Options
 
 | Flag | Default | Description |
@@ -124,13 +136,25 @@ The web app includes several advanced optimizations for low-latency, real-time p
 | `--width` | `512` | Output width |
 | `--height` | `512` | Output height |
 | `--steps` | `6` | Denoising steps |
+| `--audio-model-type` | `whisper` | Choice between `whisper` and `wav2vec2`. |
 | `--cfg` | `1.0` | Classifier-free guidance scale |
 | `--port` | `8080` | HTTP server port |
 | `--vad-threshold` | `0.005` | Server-side silence threshold (RMS). Clips below this are discarded. Set to `0.0` to disable. |
 | `--use-init-latent` | `True` | **Enable latent state preservation** for smooth pose continuity between clips |
 | `--audio-margin` | `2` | Audio feature context margin (frames). |
+| `--low-ram` | `False` | **Optional**. Disable pose pre-loading to save ~1GB RAM (increases latency). |
 
-## Development
+## Audio Models
+
+The web app now supports two different audio models for feature extraction:
+
+1.  **Whisper (Default)**: Uses OpenAI's Whisper model (Tiny by default). Robust and handles noise well. Uses `audio_model_path` in your config.
+2.  **Wav2Vec2**: Uses Facebook's Wav2Vec2 model. Often provides more detailed phonetic alignment. Uses `wav2vec2_audio_guider_path` in your config.
+
+To switch models, use the `--audio-model-type` flag:
+```bash
+python app.py --audio-model-type wav2vec2
+```
 
 The key implementation files are:
 

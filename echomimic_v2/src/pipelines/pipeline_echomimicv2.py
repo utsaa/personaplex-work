@@ -433,6 +433,8 @@ class EchoMimicV2Pipeline(DiffusionPipeline):
         fps=25,
         audio_margin=2,
         start_idx=0,
+        init_latents=None,
+        audio_context_frames=0,
         **kwargs,
     ):
         # Default height and width to unet
@@ -466,8 +468,24 @@ class EchoMimicV2Pipeline(DiffusionPipeline):
 
         whisper_feature = self.audio_guider.audio2feat(audio_path)
 
-        whisper_chunks = self.audio_guider.feature2chunks(feature_array=whisper_feature, fps=fps)
+        whisper_chunks = self.audio_guider.feature2chunks(feature_array=whisper_feature, fps=fps, audio_feat_length=[audio_margin, audio_margin])
+        
+        # Audio Context Trimming
+        if audio_context_frames > 0:
+            if audio_context_frames < whisper_chunks.shape[0]:
+                whisper_chunks = whisper_chunks[audio_context_frames:]
+            else:
+                print(f"[WARNING] Audio context frames {audio_context_frames} >= chunk length {whisper_chunks.shape[0]}, no trimming done.")
+        
         audio_frame_num = whisper_chunks.shape[0]
+
+        # Guard: pad by repeating the last frame to avoid shape mismatch
+        if audio_frame_num < video_length:
+            pad_count = video_length - audio_frame_num
+            pad = np.repeat(whisper_chunks[-1:], pad_count, axis=0)
+            whisper_chunks = np.concatenate([whisper_chunks, pad], axis=0)
+            audio_frame_num = whisper_chunks.shape[0]
+
         audio_fea_final = torch.Tensor(whisper_chunks).to(dtype=self.vae.dtype, device=self.vae.device)
         audio_fea_final = audio_fea_final.unsqueeze(0)
         

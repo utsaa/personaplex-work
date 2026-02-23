@@ -62,6 +62,7 @@ def parse_args():
     parser.add_argument("--refimg_name", type=str, default='natural_bk_openhand/0035.png')
     parser.add_argument("--audio_name", type=str, default='chinese/echomimicv2_woman.wav')
     parser.add_argument("--pose_name", type=str, default="01")
+    parser.add_argument("--audio_model_type", type=str, default="whisper", choices=["whisper", "wav2vec2"])
 
     args = parser.parse_args()
 
@@ -135,7 +136,14 @@ def main():
     pose_net.load_state_dict(torch.load(config.pose_encoder_path))
 
     ### load audio processor params
-    audio_processor = load_audio_model(model_path=config.audio_model_path, device=device)
+    adapter_path = None
+    if args.audio_model_type == "wav2vec2":
+        audio_model_path = getattr(config, "wav2vec2_audio_guider_path", config.audio_model_path)
+        adapter_path = getattr(config, "wav2vec2_audio_adapter_path", "./pretrained_weights/audio_processor/wav2vec2/trained_adapter.pt")
+    else:
+        audio_model_path = config.audio_model_path
+        
+    audio_processor = load_audio_model(model_path=audio_model_path, device=device, model_type=args.audio_model_type, adapter_path=adapter_path)
 
     ############# model_init finished #############
 

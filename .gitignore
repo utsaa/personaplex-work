@@ -138,6 +138,7 @@ Thumbs.db
 
 # Logs
 *.log
+*.csv
 
 # Models & weights
 *.safetensors

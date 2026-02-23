@@ -8,7 +8,7 @@ pose_encoder_path: "./pretrained_weights/pose_encoder.pth"
 motion_module_path: './pretrained_weights/motion_module_acc.pth'
 
 audio_mapper_path: "./pretrained_weights/audio_mapper-50000.pth"
-auido_guider_path: "./pretrained_weights/wav2vec2-base-960h"
+wav2vec2_audio_guider_path: "./pretrained_weights/wav2vec2-base-960h"
 auto_flow_path: "./pretrained_weights/AutoFlow"
 audio_model_path: "./pretrained_weights/audio_processor/tiny.pt"
 inference_config: "./configs/inference/inference_v2.yaml"
@@ -28,7 +28,7 @@ height: 512
 fps: 30
 iteration: 1
 seed: 42
-cfg_scale: 1.0
+cfg_scale: 2.5
 sample_steps: 6      # Critical for ACC version
-context_frames: 12   # Small batches to save memory
+context_frames: 12   # Matches the new clip-frames
 context_overlap: 4
