@@ -1,17 +1,12 @@
-"""Real-time EchoMimic-v2 watcher.
+"""Real-time EchoMimic-v2 watcher (Multi-GPU).
 
 Captures microphone audio via sounddevice, feeds it through the accelerated
 EchoMimic-v2 diffusion pipeline, and displays the generated talking-head
-video in an OpenCV window — all in real-time (with ~1-2 s latency per clip).
+video in an OpenCV window — all in real-time.
 
-Architecture (mirrors server.py decoupled queue pattern):
-  ┌──────────┐     ┌──────────────┐     ┌──────────────┐
-  │ audio_in │ ──► │ video_gen    │ ──► │ video_display│
-  │ (sd)     │     │ (diffusion)  │     │ (cv2 window) │
-  └──────────┘     └──────────────┘     └──────────────┘
-   sd callback        Thread               Thread
-   fills queue      drains audio_q        drains frame_q
-                    fills  frame_q        shows  frames
+Supports 1..N CUDA GPUs:
+  - N == 1: sequential generation with init_latent continuity
+  - N >= 2: pipelined overlap-blend for parallel GPU usage
 """
 
 import argparse
@@ -46,27 +41,44 @@ CONFIG_PATH = "./configs/prompts/infer_acc.yaml"
 DEFAULT_REF_IMAGE = "./assets/therapist_ref.png"
 DEFAULT_POSE_DIR = "./assets/halfbody_demo/pose/01"
 
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 WEIGHT_DTYPE = torch.float16
 
 # ---------------------------------------------------------------------------
-# Model loading (same pattern as server.py / original watcher)
+# GPU Detection & Utilities
+# ---------------------------------------------------------------------------
+
+def detect_gpus() -> int:
+    if not torch.cuda.is_available():
+        return 0
+    return torch.cuda.device_count()
+
+
+def blend_overlap(tail_video: np.ndarray, head_video: np.ndarray, K: int) -> np.ndarray:
+    """Linear crossfade: tail[-K:] × head[:K]. Shape (1,C,K,H,W)."""
+    if K <= 0:
+        return np.empty((tail_video.shape[0], tail_video.shape[1], 0,
+                         tail_video.shape[3], tail_video.shape[4]),
+                        dtype=tail_video.dtype)
+    tail_slice = tail_video[:, :, -K:, :, :]
+    head_slice = head_video[:, :, :K, :, :]
+    alpha = np.linspace(0.0, 1.0, K, dtype=np.float32).reshape(1, 1, K, 1, 1)
+    return (1.0 - alpha) * tail_slice + alpha * head_slice
+
+
+# ---------------------------------------------------------------------------
+# Model loading
 # ---------------------------------------------------------------------------
 
 def load_pipeline(config_path: str, device: str, weight_dtype: torch.dtype) -> EchoMimicV2Pipeline:
-    """Load all EchoMimic-v2 ACC models and return an assembled pipeline."""
-    print("[INIT] Loading EchoMimic-v2 (ACC) models ...")
+    """Load all EchoMimic-v2 ACC models on a specific device."""
+    print(f"[INIT] Loading EchoMimic-v2 (ACC) models on {device} ...")
     config = OmegaConf.load(config_path)
     infer_config = OmegaConf.load(config.inference_config)
 
-    # VAE
-    print("  loading VAE ...")
     vae = AutoencoderKL.from_pretrained(
         config.pretrained_vae_path, local_files_only=True, torch_dtype=weight_dtype,
     ).to(device=device, dtype=weight_dtype)
 
-    # Reference UNet (2D)
-    print("  loading reference UNet ...")
     reference_unet = UNet2DConditionModel.from_pretrained(
         config.pretrained_base_model_path, subfolder="unet",
     ).to(device=device, dtype=weight_dtype)
@@ -74,8 +86,6 @@ def load_pipeline(config_path: str, device: str, weight_dtype: torch.dtype) -> E
         torch.load(config.reference_unet_path, map_location="cpu"),
     )
 
-    # Denoising UNet (3D + motion module)
-    print("  loading denoising UNet (ACC) ...")
     if os.path.exists(config.motion_module_path):
         denoising_unet = EMOUNet3DConditionModel.from_pretrained_2d(
             config.pretrained_base_model_path,
@@ -97,22 +107,16 @@ def load_pipeline(config_path: str, device: str, weight_dtype: torch.dtype) -> E
         torch.load(config.denoising_unet_path, map_location="cpu"), strict=False,
     )
 
-    # Pose encoder
-    print("  loading pose encoder ...")
     pose_net = PoseEncoder(
         320, conditioning_channels=3, block_out_channels=(16, 32, 96, 256),
     ).to(device=device, dtype=weight_dtype)
     pose_net.load_state_dict(torch.load(config.pose_encoder_path, map_location="cpu"))
 
-    # Audio processor (Whisper tiny)
-    print("  loading audio processor (Whisper tiny) ...")
     audio_processor = load_audio_model(model_path=config.audio_model_path, device=device)
 
-    # Scheduler
     sched_kwargs = OmegaConf.to_container(infer_config.noise_scheduler_kwargs)
     scheduler = DDIMScheduler(**sched_kwargs)
 
-    # Assemble pipeline
     pipe = EchoMimicV2Pipeline(
         vae=vae,
         reference_unet=reference_unet,
@@ -122,16 +126,51 @@ def load_pipeline(config_path: str, device: str, weight_dtype: torch.dtype) -> E
         scheduler=scheduler,
     )
     pipe = pipe.to(device, dtype=weight_dtype)
-    print("[READY] Pipeline loaded.\n")
+    print(f"[READY] Pipeline on {device} loaded.\n")
     return pipe
 
 
+def load_all_pipelines(config_path: str, weight_dtype: torch.dtype):
+    """Load N pipelines, one per GPU. Returns (pipes, devices, num_gpus)."""
+    N = max(1, detect_gpus())
+    if N == 0:
+        devices = ["cpu"]
+        N = 1
+    else:
+        devices = [f"cuda:{i}" for i in range(N)]
+
+    pipes = [None] * N
+    errors = [None] * N
+
+    if N == 1:
+        pipes[0] = load_pipeline(config_path, devices[0], weight_dtype)
+    else:
+        def _load(idx):
+            try:
+                pipes[idx] = load_pipeline(config_path, devices[idx], weight_dtype)
+            except Exception as e:
+                errors[idx] = e
+
+        threads = []
+        for i in range(N):
+            t = threading.Thread(target=_load, args=(i,))
+            threads.append(t)
+            t.start()
+        for t in threads:
+            t.join()
+        for i, err in enumerate(errors):
+            if err is not None:
+                raise RuntimeError(f"Failed to load on {devices[i]}: {err}")
+
+    print(f"[INIT] {N} pipeline(s) loaded.")
+    return pipes, devices, N
+
+
 # ---------------------------------------------------------------------------
-# Pose helpers (same logic as server.py _prepare_pose_tensor)
+# Pose helpers
 # ---------------------------------------------------------------------------
 
 def load_pose_files(pose_dir: str) -> list[str]:
-    """Return sorted .npy filenames from pose_dir."""
     files = sorted(
         [f for f in os.listdir(pose_dir) if f.endswith(".npy")],
         key=lambda x: int(os.path.splitext(x)[0]),
@@ -141,16 +180,8 @@ def load_pose_files(pose_dir: str) -> list[str]:
 
 
 def prepare_pose_tensor(
-    pose_dir: str,
-    pose_files: list[str],
-    num_frames: int,
-    start_idx: int,
-    W: int,
-    H: int,
-    device: str,
-    dtype: torch.dtype,
+    pose_dir, pose_files, num_frames, start_idx, W, H, device, dtype,
 ) -> torch.Tensor:
-    """Build (1, 3, L, H, W) pose tensor, cycling through available poses."""
     num_available = len(pose_files)
     pose_list = []
     for i in range(num_frames):
@@ -166,8 +197,7 @@ def prepare_pose_tensor(
         pose_list.append(
             torch.Tensor(np.array(tgt_musk_pil))
             .to(dtype=dtype, device=device)
-            .permute(2, 0, 1)
-            / 255.0
+            .permute(2, 0, 1) / 255.0
         )
     return torch.stack(pose_list, dim=1).unsqueeze(0)
 
@@ -177,36 +207,28 @@ def prepare_pose_tensor(
 # ---------------------------------------------------------------------------
 
 def generate_video_clip(
-    pipe: EchoMimicV2Pipeline,
-    ref_image: Image.Image,
-    wav_path: str,
-    poses_tensor: torch.Tensor,
-    W: int, H: int,
-    clip_frames: int,
-    sample_rate: int,
-    fps: int,
-    steps: int = 4,
-    cfg: float = 1.0,
-) -> np.ndarray | None:
-    """Run the ACC pipeline. Returns (1,3,L,H,W) numpy or None."""
+    pipe, ref_image, wav_path, poses_tensor,
+    W, H, clip_frames, sample_rate, fps,
+    steps=4, cfg=1.0, init_latent=None, use_init_latent=True,
+) -> tuple:
+    """Run pipeline. Returns (video_np, final_latent)."""
     generator = torch.manual_seed(random.randint(0, 2**32 - 1))
     result = pipe(
-        ref_image,
-        wav_path,
+        ref_image, wav_path,
         poses_tensor[:, :, :clip_frames, ...],
         W, H, clip_frames,
         steps, cfg,
         generator=generator,
         audio_sample_rate=sample_rate,
-        context_frames=12,
-        fps=fps,
-        context_overlap=3,
-        start_idx=0,
+        context_frames=12, fps=fps,
+        context_overlap=3, start_idx=0,
+        init_latents=init_latent if use_init_latent else None,
     )
     video = result.videos
+    final_latent = getattr(result, 'final_latent', None)
     if isinstance(video, torch.Tensor):
-        return video.cpu().numpy()
-    return video
+        return video.cpu().numpy(), final_latent
+    return video, final_latent
 
 
 # ---------------------------------------------------------------------------
@@ -214,72 +236,57 @@ def generate_video_clip(
 # ---------------------------------------------------------------------------
 
 def audio_capture_thread(
-    audio_queue: queue.Queue,
-    sample_rate: int,
-    stop_event: threading.Event,
-    sd_device_index: int | None = None,
+    audio_queue, sample_rate, stop_event, sd_device_index=None,
 ):
-    """Continuously capture mic audio and push float32 chunks to audio_queue."""
     import sounddevice as sd
-
-    block_duration = 0.1  # 100 ms blocks
+    block_duration = 0.1
     blocksize = int(sample_rate * block_duration)
 
     def callback(indata, frames, time_info, status):
         if status:
             print(f"[AUDIO] {status}")
-        # indata is (frames, channels) float32
-        # put_nowait: callback runs on PortAudio's real-time thread and must
-        # NEVER block, otherwise audio samples are silently dropped by the OS.
-        # audio_queue is unbounded so Full should never happen, but guard anyway.
         try:
             audio_queue.put_nowait(indata[:, 0].copy())
         except queue.Full:
-            pass  # drop chunk rather than block the audio thread
+            pass
 
     print(f"[AUDIO] Opening input stream @ {sample_rate} Hz ...")
     with sd.InputStream(
-        samplerate=sample_rate,
-        channels=1,
-        dtype="float32",
-        blocksize=blocksize,
-        device=sd_device_index,
-        callback=callback,
+        samplerate=sample_rate, channels=1, dtype="float32",
+        blocksize=blocksize, device=sd_device_index, callback=callback,
     ):
         stop_event.wait()
     print("[AUDIO] Input stream closed.")
 
 
 # ---------------------------------------------------------------------------
-# Thread: video generation (audio_queue -> diffusion -> frame_queue)
+# Thread: video generation — unified 1..N GPU
 # ---------------------------------------------------------------------------
 
 def video_generation_thread(
-    pipe: EchoMimicV2Pipeline,
-    ref_image: Image.Image,
-    pose_dir: str,
-    pose_files: list[str],
-    audio_queue: queue.Queue,
-    frame_queue: queue.Queue,
-    stop_event: threading.Event,
-    sample_rate: int = 16000,
-    fps: int = 24,
-    clip_frames: int = 12,
-    W: int = 512,
-    H: int = 512,
-    steps: int = 4,
-    cfg: float = 1.0,
+    pipes, devices, num_gpus, overlap_frames,
+    ref_image, pose_dir, pose_files,
+    audio_queue, frame_queue, stop_event,
+    sample_rate=16000, fps=24, clip_frames=12,
+    W=512, H=512, steps=4, cfg=1.0,
 ):
-    """Accumulate audio -> temp WAV -> pipeline -> push BGR frames to frame_queue."""
+    """Generate video clips, alternating GPUs with overlap-blend for N>=2."""
     samples_per_clip = int(sample_rate * clip_frames / fps)
     audio_buffer = np.array([], dtype=np.float32)
     pose_idx = 0
+    
+    K = overlap_frames if num_gpus >= 2 else 0
+    gpu_idx = 0
+    is_first_chunk = True
+    
+    # Per-GPU state
+    last_latents = [None] * num_gpus  # For single-GPU init_latent continuity
+    tail_buffers = [None] * num_gpus  # For multi-GPU overlap blending
 
     print(f"[GEN] Waiting for audio (need {samples_per_clip} samples = "
-          f"{clip_frames/fps:.2f}s per clip) ...")
+          f"{clip_frames/fps:.2f}s per clip), {num_gpus} GPU(s), K={K} ...")
 
     while not stop_event.is_set():
-        # Drain audio_queue into buffer
         try:
             while True:
                 chunk = audio_queue.get(timeout=0.05)
@@ -287,57 +294,90 @@ def video_generation_thread(
         except queue.Empty:
             pass
 
-        # Not enough audio yet
         if len(audio_buffer) < samples_per_clip:
             continue
 
-        # Take one clip's worth
         clip_audio = audio_buffer[:samples_per_clip]
         audio_buffer = audio_buffer[samples_per_clip:]
 
         tmp_wav_path = None
         try:
-            # Write temp WAV (Whisper expects a file path)
             tmp_fd, tmp_wav_path = tempfile.mkstemp(suffix=".wav")
             os.close(tmp_fd)
             with wave.open(tmp_wav_path, "wb") as wf:
                 wf.setnchannels(1)
-                wf.setsampwidth(2)  # 16-bit
+                wf.setsampwidth(2)
                 wf.setframerate(sample_rate)
                 pcm_int16 = np.clip(clip_audio * 32767, -32768, 32767).astype(np.int16)
                 wf.writeframes(pcm_int16.tobytes())
 
-            # Prepare pose tensor
+            device = devices[gpu_idx]
+            pipe = pipes[gpu_idx]
+
+            gen_frames = clip_frames + K if is_first_chunk else K + clip_frames
             poses_tensor = prepare_pose_tensor(
-                pose_dir, pose_files, clip_frames, pose_idx, W, H,
-                device=DEVICE, dtype=WEIGHT_DTYPE,
+                pose_dir, pose_files, gen_frames, pose_idx, W, H,
+                device=device, dtype=WEIGHT_DTYPE,
             )
             pose_idx = (pose_idx + clip_frames) % len(pose_files)
 
-            # Run diffusion
             t0 = time.perf_counter()
-            video_np = generate_video_clip(
-                pipe, ref_image, tmp_wav_path, poses_tensor,
-                W, H, clip_frames, sample_rate, fps, steps, cfg,
-            )
-            dt = time.perf_counter() - t0
-            print(f"[GEN] Clip generated in {dt:.2f}s "
-                  f"({clip_frames} frames, {clip_frames/fps:.2f}s of video)")
 
-            # Push individual BGR frames into frame_queue
-            if video_np is not None:
-                n_frames = video_np.shape[2]
+            if num_gpus >= 2:
+                # Multi-GPU: overlap-blend mode
+                video_np, _ = generate_video_clip(
+                    pipe, ref_image, tmp_wav_path, poses_tensor,
+                    W, H, gen_frames, sample_rate, fps, steps, cfg,
+                    init_latent=None, use_init_latent=False,
+                )
+
+                if video_np is not None:
+                    if is_first_chunk:
+                        output_video = video_np
+                        tail_buffers[gpu_idx] = video_np[:, :, -K:, :, :].copy() if K > 0 else None
+                        is_first_chunk = False
+                    else:
+                        prev_gpu = (gpu_idx - 1) % num_gpus
+                        tail_buf = tail_buffers[prev_gpu]
+                        tail_buffers[prev_gpu] = None
+
+                        if tail_buf is not None and K > 0:
+                            blended = blend_overlap(tail_buf, video_np, K)
+                            output_video = np.concatenate([blended, video_np[:, :, K:, :, :]], axis=2)
+                            output_video = output_video[:, :, -clip_frames:, :, :]
+                        else:
+                            output_video = video_np[:, :, -clip_frames:, :, :]
+
+                        tail_buffers[gpu_idx] = video_np[:, :, -K:, :, :].copy() if K > 0 else None
+
+                    gpu_idx = (gpu_idx + 1) % num_gpus
+            else:
+                # Single-GPU: init_latent continuity
+                video_np, final_latent = generate_video_clip(
+                    pipe, ref_image, tmp_wav_path, poses_tensor,
+                    W, H, clip_frames, sample_rate, fps, steps, cfg,
+                    init_latent=last_latents[0], use_init_latent=True,
+                )
+                last_latents[0] = final_latent
+                output_video = video_np
+
+            dt = time.perf_counter() - t0
+            print(f"[GEN] GPU {gpu_idx}: Clip in {dt:.2f}s "
+                  f"({gen_frames} gen, {output_video.shape[2] if output_video is not None else 0} out)")
+
+            if output_video is not None:
+                n_frames = output_video.shape[2]
                 for f_idx in range(n_frames):
                     if stop_event.is_set():
                         return
-                    frame = video_np[0, :, f_idx, :, :]  # (3, H, W) in [0,1]
+                    frame = output_video[0, :, f_idx, :, :]
                     frame = (frame * 255).clip(0, 255).astype(np.uint8)
-                    frame = frame.transpose(1, 2, 0)  # (H, W, 3) RGB
+                    frame = frame.transpose(1, 2, 0)
                     frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
                     try:
                         frame_queue.put_nowait(frame_bgr)
                     except queue.Full:
-                        pass  # drop if display can't keep up
+                        pass
 
         except Exception as e:
             print(f"[GEN] Error: {e}")
@@ -351,19 +391,12 @@ def video_generation_thread(
 
 
 # ---------------------------------------------------------------------------
-# Main thread: video display (frame_queue -> cv2.imshow)
+# Main thread: video display
 # ---------------------------------------------------------------------------
 
-def display_loop(
-    frame_queue: queue.Queue,
-    stop_event: threading.Event,
-    fps: int = 24,
-    window_name: str = "EchoMimic-v2 Live",
-):
-    """Pop frames from frame_queue and display at target FPS. Runs on main thread."""
+def display_loop(frame_queue, stop_event, fps=24, window_name="EchoMimic-v2 Live"):
     frame_interval = 1.0 / fps
     last_frame = None
-
     print(f"[DISPLAY] Showing video at {fps} FPS. Press 'q' or ESC to quit.\n")
 
     while not stop_event.is_set():
@@ -371,13 +404,13 @@ def display_loop(
             frame_bgr = frame_queue.get(timeout=0.1)
             last_frame = frame_bgr
         except queue.Empty:
-            pass  # no new frame -- keep showing last one (or blank)
+            pass
 
         if last_frame is not None:
             cv2.imshow(window_name, last_frame)
 
         key = cv2.waitKey(max(1, int(frame_interval * 1000)))
-        if key in (ord("q"), 27):  # 'q' or ESC
+        if key in (ord("q"), 27):
             stop_event.set()
             break
 
@@ -390,54 +423,49 @@ def display_loop(
 # ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="Real-time EchoMimic-v2 watcher (sd audio -> video)")
-    parser.add_argument("--config", type=str, default=CONFIG_PATH,
-                        help="Path to infer_acc.yaml config.")
-    parser.add_argument("--reference-image", type=str, default=DEFAULT_REF_IMAGE,
-                        help="Reference face image for animation.")
-    parser.add_argument("--pose-dir", type=str, default=DEFAULT_POSE_DIR,
-                        help="Directory with pose .npy files.")
-    parser.add_argument("--sample-rate", type=int, default=16000,
-                        help="Audio sample rate for capture & Whisper (default: 16000).")
-    parser.add_argument("--fps", type=int, default=24, help="Video FPS (default: 24).")
-    parser.add_argument("--clip-frames", type=int, default=12,
-                        help="Frames per clip (default: 12 = 0.5s at 24fps).")
-    parser.add_argument("--width", type=int, default=512, help="Video width (default: 512).")
-    parser.add_argument("--height", type=int, default=512, help="Video height (default: 512).")
-    parser.add_argument("--steps", type=int, default=4,
-                        help="Inference steps (ACC default: 4).")
-    parser.add_argument("--cfg", type=float, default=1.0, help="Guidance scale (default: 1.0).")
-    parser.add_argument("--sd-device", type=int, default=None,
-                        help="Sounddevice input device index (None = system default).")
-    parser.add_argument("--list-devices", action="store_true",
-                        help="List available audio devices and exit.")
+    parser = argparse.ArgumentParser(description="Real-time EchoMimic-v2 watcher (multi-GPU)")
+    parser.add_argument("--config", type=str, default=CONFIG_PATH)
+    parser.add_argument("--reference-image", type=str, default=DEFAULT_REF_IMAGE)
+    parser.add_argument("--pose-dir", type=str, default=DEFAULT_POSE_DIR)
+    parser.add_argument("--sample-rate", type=int, default=16000)
+    parser.add_argument("--fps", type=int, default=24)
+    parser.add_argument("--clip-frames", type=int, default=12)
+    parser.add_argument("--width", type=int, default=512)
+    parser.add_argument("--height", type=int, default=512)
+    parser.add_argument("--steps", type=int, default=4)
+    parser.add_argument("--cfg", type=float, default=1.0)
+    parser.add_argument("--sd-device", type=int, default=None)
+    parser.add_argument("--list-devices", action="store_true")
+    parser.add_argument("--overlap-frames", type=int, default=6,
+                        help="Overlap frames (K) for multi-GPU blending. Default: 6.")
     args = parser.parse_args()
 
-    # Optionally just list audio devices
     if args.list_devices:
         import sounddevice as sd
         print(sd.query_devices())
         return
 
-    # Load pipeline
-    pipe = load_pipeline(args.config, DEVICE, WEIGHT_DTYPE)
+    # Load N pipelines
+    pipes, devices, num_gpus = load_all_pipelines(args.config, WEIGHT_DTYPE)
+    K = args.overlap_frames if num_gpus >= 2 else 0
+    print(f"[INIT] {num_gpus} GPU(s), overlap K={K}")
 
-    # Load reference image
-    assert os.path.exists(args.reference_image), f"Reference image not found: {args.reference_image}"
+    # Reference image
+    assert os.path.exists(args.reference_image), f"Not found: {args.reference_image}"
     ref_image = Image.open(args.reference_image).convert("RGB")
     print(f"[INIT] Reference image: {args.reference_image}")
 
-    # Load pose files
-    assert os.path.isdir(args.pose_dir), f"Pose directory not found: {args.pose_dir}"
+    # Pose files
+    assert os.path.isdir(args.pose_dir), f"Not found: {args.pose_dir}"
     pose_files = load_pose_files(args.pose_dir)
     print(f"[INIT] Loaded {len(pose_files)} pose files from {args.pose_dir}")
 
-    # Shared queues & stop event
-    audio_queue = queue.Queue()                # unbounded – sd callback must NEVER block
-    frame_queue = queue.Queue(maxsize=200)     # BGR frames ready for display
+    # Queues & stop event
+    audio_queue = queue.Queue()
+    frame_queue = queue.Queue(maxsize=200)
     stop_event = threading.Event()
 
-    # Start audio capture thread
+    # Audio capture thread
     audio_thread = threading.Thread(
         target=audio_capture_thread,
         args=(audio_queue, args.sample_rate, stop_event, args.sd_device),
@@ -445,11 +473,12 @@ def main():
     )
     audio_thread.start()
 
-    # Start video generation thread
+    # Video generation thread (multi-GPU aware)
     gen_thread = threading.Thread(
         target=video_generation_thread,
         args=(
-            pipe, ref_image, args.pose_dir, pose_files,
+            pipes, devices, num_gpus, K,
+            ref_image, args.pose_dir, pose_files,
             audio_queue, frame_queue, stop_event,
             args.sample_rate, args.fps, args.clip_frames,
             args.width, args.height, args.steps, args.cfg,
@@ -458,7 +487,7 @@ def main():
     )
     gen_thread.start()
 
-    # Run display on main thread (cv2.imshow requires main thread on most OS)
+    # Display on main thread
     try:
         display_loop(frame_queue, stop_event, fps=args.fps)
     except KeyboardInterrupt:

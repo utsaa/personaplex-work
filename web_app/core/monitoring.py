@@ -5,16 +5,17 @@ import subprocess
 import os
 import csv
 from datetime import datetime
+from typing import Optional, Tuple
 
 class PerformanceMonitor:
-    def __init__(self, output_dir, run_id):
+    def __init__(self, output_dir: str, run_id: str) -> None:
         self.log_dir = output_dir
         os.makedirs(self.log_dir, exist_ok=True)
         self.log_path = os.path.join(self.log_dir, f"perf_{run_id}.csv")
         self.stop_event = threading.Event()
         self.thread = None
 
-    def start(self, interval=1.0):
+    def start(self, interval: float = 1.0) -> None:
         self.stop_event.clear()
         # Initialize CSV header
         with open(self.log_path, 'w', newline='') as f:
@@ -25,13 +26,13 @@ class PerformanceMonitor:
         self.thread.start()
         print(f"[MONITOR] Performance logging started: {self.log_path}")
 
-    def stop(self):
+    def stop(self) -> None:
         if self.thread:
             self.stop_event.set()
             self.thread.join()
             print("[MONITOR] Performance logging stopped.")
 
-    def _get_gpu_stats(self):
+    def _get_gpu_stats(self) -> Tuple[float, float, float]:
         try:
             # Query nvidia-smi for utilization and memory
             result = subprocess.run(
@@ -49,7 +50,7 @@ class PerformanceMonitor:
             pass
         return 0.0, 0.0, 0.0
 
-    def _monitor_loop(self, interval):
+    def _monitor_loop(self, interval: float) -> None:
         while not self.stop_event.is_set():
             try:
                 cpu = psutil.cpu_percent(interval=None)

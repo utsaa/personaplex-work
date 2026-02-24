@@ -14,8 +14,12 @@ from src.pipelines.pipeline_echomimicv2_acc import EchoMimicV2Pipeline
 from src.models.pose_encoder import PoseEncoder
 
 def load_pipeline(config_path: str, device: str, weight_dtype: torch.dtype, echomimic_dir: str, audio_model_type: str = "whisper") -> EchoMimicV2Pipeline:
-    """Load all EchoMimic-v2 ACC models and return an assembled pipeline."""
-    print(f"[INIT] Loading EchoMimic-v2 (ACC) models (Audio Type: {audio_model_type}) ...")
+    """Load all EchoMimic-v2 ACC models and return an assembled pipeline.
+    
+    Args:
+        device: Target device string, e.g. ``"cuda"``, ``"cuda:0"``, ``"cuda:1"``.
+    """
+    print(f"[INIT] Loading EchoMimic-v2 (ACC) models on {device} (Audio Type: {audio_model_type}) ...")
     config = OmegaConf.load(config_path)
     # Handle relative paths in config based on echomimic_dir
     infer_config_path = config.inference_config

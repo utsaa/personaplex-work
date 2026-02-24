@@ -1,9 +1,15 @@
 
+import argparse
 import asyncio
 import queue
 import threading
+
 import numpy as np
 from aiohttp import web
+from PIL import Image
+
+from core.gpu import MultiGPUManager
+from core.pose import PoseProvider
 from core.workers import (
     input_preparation_thread,
     video_generation_thread,
@@ -11,17 +17,22 @@ from core.workers import (
     warmup_pipeline
 )
 
-async def run_server(pipe, ref_image, pose_provider, args, index_html_path):
-    print(f"[INIT] Caching reference UNet states...")
-    reference_cache = pipe.encode_reference(
-        ref_image, args.width, args.height, args.steps, args.cfg,
-        dtype=pipe.dtype, device=pipe.device
+async def run_server(
+    gpu_manager: MultiGPUManager,
+    ref_image: Image.Image,
+    pose_provider: PoseProvider,
+    args: argparse.Namespace,
+    index_html_path: str,
+) -> None:
+    # Encode reference on all GPUs
+    print(f"[INIT] Encoding reference on {gpu_manager.num_gpus} GPU(s)...")
+    gpu_manager.encode_references(
+        ref_image, args.width, args.height, args.steps, args.cfg
     )
-    print(f"[INIT] Reference cached.")
+    print(f"[INIT] Reference encoded on all GPUs.")
 
     if args.compile_unet:
-        # Run warmup while we have context
-        warmup_pipeline(pipe, ref_image, pose_provider, args, reference_cache)
+        warmup_pipeline(gpu_manager, ref_image, pose_provider, args)
 
     # Queues for Parallel Workers
     input_queue = queue.Queue()          # WS -> Input Prep
@@ -42,18 +53,18 @@ async def run_server(pipe, ref_image, pose_provider, args, index_html_path):
         ),
         kwargs={
             "vad_threshold": args.vad_threshold,
-            "audio_margin": args.audio_margin
+            "audio_margin": args.audio_margin,
+            "overlap_frames": gpu_manager.overlap_frames,
         },
         daemon=True
     )
     input_thread.start()
 
-    # 2. Video Generation Thread (GPU)
+    # 2. Video Generation Thread (GPU) — handles 1..N GPUs
     gen_thread = threading.Thread(
         target=video_generation_thread,
         args=(
-            pipe, ref_image, prepared_queue, raw_clip_queue, stop_event,
-            reference_cache,
+            gpu_manager, ref_image, prepared_queue, raw_clip_queue, stop_event,
             args.sample_rate, args.fps, args.clip_frames,
             args.width, args.height, args.steps, args.cfg,
         ),
@@ -77,10 +88,10 @@ async def run_server(pipe, ref_image, pose_provider, args, index_html_path):
     with open(index_html_path, "r", encoding="utf-8") as f:
         index_html = f.read()
 
-    async def index_handler(request):
+    async def index_handler(request: web.Request) -> web.Response:
         return web.Response(text=index_html, content_type="text/html")
 
-    async def websocket_handler(request):
+    async def websocket_handler(request: web.Request) -> web.WebSocketResponse:
         ws = web.WebSocketResponse()
         await ws.prepare(request)
         print("[WEB] Client connected.")
@@ -159,8 +170,5 @@ async def run_server(pipe, ref_image, pose_provider, args, index_html_path):
         print("\n[WEB] Interrupted.")
     finally:
         stop_event.set()
-        # Wait for threads to finish? No, daemon threads die with main.
-        # But we can try to join for clean shutdown if we want.
-        # gen_thread.join(timeout=1)
         await runner.cleanup()
         print("[WEB] Done.")

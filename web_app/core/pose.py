@@ -1,11 +1,13 @@
 
 import os
+from typing import List
+
 import torch
 import numpy as np
 from PIL import Image
 from src.utils.dwpose_util import draw_pose_select_v2
 
-def load_pose_files(pose_dir: str) -> list[str]:
+def load_pose_files(pose_dir: str) -> List[str]:
     files = sorted(
         [f for f in os.listdir(pose_dir) if f.endswith(".npy")],
         key=lambda x: int(os.path.splitext(x)[0]),
@@ -43,7 +45,15 @@ class PoseProvider:
         raise NotImplementedError
 
 class OnTheFlyPoseProvider(PoseProvider):
-    def __init__(self, pose_dir, pose_files, W, H, device, dtype):
+    def __init__(
+        self,
+        pose_dir: str,
+        pose_files: List[str],
+        W: int,
+        H: int,
+        device: str,
+        dtype: torch.dtype,
+    ) -> None:
         self.pose_dir = pose_dir
         self.pose_files = pose_files
         self.W = W
@@ -73,10 +83,18 @@ class OnTheFlyPoseProvider(PoseProvider):
         return torch.stack(pose_list, dim=1).unsqueeze(0)
 
 class PreloadedPoseProvider(PoseProvider):
-    def __init__(self, pose_dir, pose_files, W, H, device, dtype):
+    def __init__(
+        self,
+        pose_dir: str,
+        pose_files: List[str],
+        W: int,
+        H: int,
+        device: str,
+        dtype: torch.dtype,
+    ) -> None:
         print(f"[INIT] Pre-loading {len(pose_files)} pose tensors to CPU RAM...")
         self.device = device
-        self.tensors = []
+        self.tensors: List[torch.Tensor] = []
         for i, f in enumerate(pose_files):
              # Load but store on CPU
              t = get_pose_tensor(pose_dir, f, W, H, "cpu", dtype)
