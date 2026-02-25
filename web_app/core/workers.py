@@ -632,8 +632,9 @@ def warmup_pipeline(gpu_manager: MultiGPUManager, ref_image, pose_provider, args
             poses_tensor = pose_provider.get_batch(0, args.clip_frames)
             generator = torch.manual_seed(0)
 
+            print(f"  [WARM] Warmup pass 1 (init_latents=None, ctx=0) on {device} ...")
             with torch.no_grad():
-                pipe(
+                result = pipe(
                     ref_image, dummy_audio,
                     poses_tensor[:, :, :args.clip_frames, ...],
                     args.width, args.height, args.clip_frames, args.steps, args.cfg,
@@ -646,6 +647,26 @@ def warmup_pipeline(gpu_manager: MultiGPUManager, ref_image, pose_provider, args
                     reference_cache=ref_cache,
                     audio_context_frames=0,
                 )
+            
+            # Pass 2: Warmup with init_latents and audio_context > 0
+            # This captures the variations used in actual inference.
+            if args.use_init_latent:
+                print(f"  [WARM] Warmup pass 2 (init_latents=Tensor, ctx=12) on {device} ...")
+                with torch.no_grad():
+                    pipe(
+                        ref_image, dummy_audio,
+                        poses_tensor[:, :, :args.clip_frames, ...],
+                        args.width, args.height, args.clip_frames, args.steps, args.cfg,
+                        generator=generator,
+                        audio_sample_rate=args.sample_rate,
+                        context_frames=12, fps=args.fps,
+                        context_overlap=3, start_idx=0,
+                        audio_margin=args.audio_margin,
+                        init_latents=result.final_latent,
+                        reference_cache=ref_cache,
+                        audio_context_frames=12,
+                    )
+
             print(f"[INIT] Warmup complete on {device}.")
 
         except Exception as e:

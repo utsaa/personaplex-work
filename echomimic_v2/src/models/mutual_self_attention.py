@@ -141,51 +141,55 @@ class ReferenceAttentionControl:
                         **cross_attention_kwargs,
                     )
                 if MODE == "read":
-                    bank_feas = [
-                        rearrange(
-                            d.unsqueeze(1).repeat(1, video_length, 1, 1),
-                            "b t l c -> (b t) l c",
-                        )
-                        for d in self.bank
-                    ]
+                    # Repeat reference features for each frame in the batch
+                    bf = hidden_states.shape[0]
+                    b = self.bank[0].shape[0] if self.bank else 1
+                    f = bf // b
+                    
+                    bank_feas = []
+                    for d in self.bank:
+                        # d is already (B, L, C)
+                        feat = d.to(device)
+                        feat = feat.repeat_interleave(f, dim=0)
+                        bank_feas.append(feat)
+
                     modify_norm_hidden_states = torch.cat(
                         [norm_hidden_states] + bank_feas, dim=1
                     )
-                    # print(f"modify_norm_hidden_states:{modify_norm_hidden_states.shape}")
 
-                    hidden_states_uc = (
-                        self.attn1(
-                            norm_hidden_states,
-                            encoder_hidden_states=modify_norm_hidden_states,
-                            attention_mask=attention_mask,
-                        )
-                        + hidden_states
-                    )
-                    if do_classifier_free_guidance:
-                        hidden_states_c = hidden_states_uc.clone()
-                        _uc_mask = uc_mask.clone()
-                        # print(hidden_states_c.shape, _uc_mask.shape)
-                        if hidden_states.shape[0] != _uc_mask.shape[0]:
-                            _uc_mask = (
-                                torch.Tensor(
-                                    [1] * (hidden_states.shape[0] // 2)
-                                    + [0] * (hidden_states.shape[0] // 2)
-                                )
-                                .to(device)
-                                .bool()
-                            )
-                        # print(hidden_states_c.shape, norm_hidden_states.shape, hidden_states.shape, _uc_mask.shape)
-                        hidden_states_c[_uc_mask] = (
+                    if not do_classifier_free_guidance:
+                        hidden_states = (
                             self.attn1(
-                                norm_hidden_states[_uc_mask],
-                                encoder_hidden_states=norm_hidden_states[_uc_mask], # B * 4096 * 768
+                                norm_hidden_states,
+                                encoder_hidden_states=modify_norm_hidden_states,
                                 attention_mask=attention_mask,
                             )
-                            + hidden_states[_uc_mask]
+                            + hidden_states
                         )
-                        hidden_states = hidden_states_c.clone()
                     else:
-                        hidden_states = hidden_states_uc
+                        # Split batch into Unconditional and Conditional halves
+                        half = hidden_states.shape[0] // 2
+                        
+                        # UC part: Pure self-attention (no reference image features)
+                        norm_uc = norm_hidden_states[:half]
+                        attn_uc = self.attn1(
+                            norm_uc,
+                            encoder_hidden_states=norm_uc,
+                            attention_mask=attention_mask[:half] if attention_mask is not None else None,
+                        ) + hidden_states[:half]
+                        
+                        # C part: Self-attention with reference image features
+                        norm_c = norm_hidden_states[half:]
+                        # Use the previously computed modify_norm_hidden_states for the second half
+                        modify_c = modify_norm_hidden_states[half:]
+                        attn_c = self.attn1(
+                            norm_c,
+                            encoder_hidden_states=modify_c,
+                            attention_mask=attention_mask[half:] if attention_mask is not None else None,
+                        ) + hidden_states[half:]
+
+                        # Combine
+                        hidden_states = torch.cat([attn_uc, attn_c], dim=0)
 
                     # self.bank.clear()
                     if self.attn2 is not None:

@@ -169,6 +169,11 @@ def main() -> None:
 
     # Compilation (apply to all GPUs)
     if args.compile_unet:
+        # Increase recompile limit and disable static parameter shapes 
+        # to prevent eager fallback from ResNet channel variations.
+        torch._dynamo.config.force_parameter_static_shapes = False
+        torch._dynamo.config.recompile_limit = 120
+
         valid_modes = ["default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"]
         if args.compile_unet_mode not in valid_modes:
             raise ValueError(f"Invalid mode --compile-unet-mode='{args.compile_unet_mode}'. "
