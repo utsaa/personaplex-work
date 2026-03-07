@@ -20,9 +20,48 @@ from core.pose import PoseProvider
 # Maximum time to wait for a single GPU generation result (seconds)
 GPU_RESULT_TIMEOUT_S: int = 300
 
+# Duration of silent audio to flush when the queue is empty (seconds)
+EMPTY_AUDIO_DURATION: float = 0.5
 # ---------------------------------------------------------------------------
 # Worker 1: Input Preparation (CPU)
 # ---------------------------------------------------------------------------
+
+def _perform_idle_flush(
+    audio_history_buffer: np.ndarray,
+    history_samples: int,
+    sample_rate: int,
+    fps: int,
+    pose_provider: PoseProvider,
+    pose_idx: int,
+    prepared_queue: queue.Queue,
+) -> tuple[np.ndarray, int]:
+    """Flushes a short silent clip to return avatar to neutral pose."""
+    flush_samples = int(sample_rate * EMPTY_AUDIO_DURATION)
+    print(f"[PREP] Queue empty. Flushing {EMPTY_AUDIO_DURATION}s of silent audio to reset position.")
+    
+    silent_clip = np.zeros(flush_samples, dtype=np.float32)
+    # full_window = history + silence
+    full_window = np.concatenate((audio_history_buffer, silent_clip))
+    ctx_frames = int((len(audio_history_buffer) / sample_rate) * fps)
+    
+    try:
+        # Get poses for this short silent clip
+        flush_frames = int(EMPTY_AUDIO_DURATION * fps)
+        poses_tensor = pose_provider.get_batch(pose_idx, flush_frames)
+        new_pose_idx = pose_idx + flush_frames
+        
+        # Backlog is no longer passed here; calculated real-time in the loop
+        batch = (full_window, poses_tensor, ctx_frames, silent_clip.copy(), False)
+        prepared_queue.put(batch)
+        
+        # Update history with the silence we just "sent"
+        new_history = np.concatenate((audio_history_buffer, silent_clip))[-history_samples:]
+        return new_history, new_pose_idx
+        
+    except Exception as e:
+        print(f"[PREP] Flush Error: {e}")
+        return audio_history_buffer, pose_idx
+
 
 def input_preparation_thread(
     audio_queue: queue.Queue,
@@ -56,6 +95,10 @@ def input_preparation_thread(
     pose_idx = 0
     consecutive_silent_clips = 0
     idle_clips_limit = max(1, int(1.0 * fps / clip_frames))
+    
+    # State for empty-audio flushing
+    has_flushed = False
+    should_reset_after_flush = False
 
     print(f"[PREP] Waiting for audio (target clip: {samples_per_clip} samples) ...")
     print(f"[PREP] Audio Context: {history_samples/sample_rate:.2f}s history + "
@@ -94,12 +137,19 @@ def input_preparation_thread(
                 continue
 
             # Speech detected
-            if consecutive_silent_clips > 0:
+            if consecutive_silent_clips > 0 or should_reset_after_flush:
                 print(f"[PREP] Audio detected (RMS={clip_rms:.4f}). Starting...")
-                # If we were silent for a long time, the GPU thread's last_latent is stale.
-                if consecutive_silent_clips > (idle_clips_limit * 4):
+                # If we were silent for a long time, or we just flushed, reset latent.
+                if (consecutive_silent_clips > (idle_clips_limit * 4)) or should_reset_after_flush:
                     reset_latent = True
+                    if should_reset_after_flush:
+                        print("[PREP] Resetting latent after empty flush.")
+                    else:
+                        print(f"[PREP] Silence limit hit ({consecutive_silent_clips} clips). Signaling pipeline reset.")
+                
+                should_reset_after_flush = False
             
+            has_flushed = False
             consecutive_silent_clips = 0
 
             # Prepare Inputs
@@ -125,6 +175,12 @@ def input_preparation_thread(
                 batch = (full_window, poses_tensor, ctx_frames, current_audio.copy(), reset_latent)
                 prepared_queue.put(batch)
 
+                # CPU-side backlog: items in buffer + items in queue
+                q_backlog = prepared_queue.qsize() * (clip_frames / fps)
+                buf_backlog = len(incoming_audio_buffer) / sample_rate
+                backlog_secs = buf_backlog + q_backlog
+                print(f"[PREP] {backlog_secs:.2f}s of audio accumulated (CPU time).")
+
                 # Update history
                 audio_history_buffer = np.concatenate((audio_history_buffer, current_audio))[-history_samples:]
 
@@ -132,6 +188,15 @@ def input_preparation_thread(
                 print(f"[PREP] Error: {e}")
                 pass
         else:
+            # 3. Handle empty queue / idle flush
+            if audio_queue.empty() and not has_flushed and len(incoming_audio_buffer) < samples_per_clip:
+                audio_history_buffer, pose_idx = _perform_idle_flush(
+                    audio_history_buffer, history_samples, sample_rate, fps,
+                    pose_provider, pose_idx, prepared_queue
+                )
+                has_flushed = True
+                should_reset_after_flush = True
+            
             # Wait a bit if not enough audio
             time.sleep(0.005)
 
@@ -269,6 +334,11 @@ def _run_single_gpu_loop(
         if reset_latent:
             gpu_manager.last_latents[0] = None
             print("[GEN] Pipeline reset due to silence.")
+
+        # Real-time backlog: items in prepared_queue + what's already being processed
+        # Since we just took one item out, the backlog is qsize * duration
+        backlog_secs = prepared_queue.qsize() * (clip_frames / fps)
+        print(f"[GEN] {backlog_secs:.2f}s of audio waiting (GPU time).")
 
         try:
             t0 = time.perf_counter()
@@ -417,6 +487,12 @@ def _run_multi_gpu_loop(
                     pending.clear()
                     print("[GEN] Pipeline reset due to silence.")
 
+                # Real-time backlog: current prepared_queue + what is already dispatched (pending)
+                q_backlog = prepared_queue.qsize() * (clip_frames / fps)
+                p_backlog = len(pending) * (clip_frames / fps)
+                backlog_secs = q_backlog + p_backlog
+                print(f"[GEN] {backlog_secs:.2f}s of audio waiting (GPU time).")
+
                 gpu_idx = next_gpu % num_gpus
 
                 if is_first_chunk:
@@ -534,7 +610,7 @@ def _drain_pending(
 ) -> None:
     """Wait for and process all pending futures before a reset."""
     while pending:
-        future, audio, gen_frames, gpu_idx, was_first = pending.popleft()
+        future, audio, gen_frames, gpu_idx, was_first, backlog = pending.popleft()
         try:
             video_np = future.result(timeout=GPU_RESULT_TIMEOUT_S)
             if video_np is None:
