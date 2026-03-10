@@ -71,6 +71,7 @@ def input_preparation_thread(
     sample_rate: int,
     fps: int,
     clip_frames: int,
+    active_clips: list[int],
     vad_threshold: float = 0.005,
     audio_margin: int = 2,
     overlap_frames: int = 0,
@@ -174,6 +175,7 @@ def input_preparation_thread(
                 # Push to GPU thread
                 batch = (full_window, poses_tensor, ctx_frames, current_audio.copy(), reset_latent)
                 prepared_queue.put(batch)
+                active_clips[0] += 1
 
                 # CPU-side backlog: items in buffer + items in queue
                 q_backlog = prepared_queue.qsize() * (clip_frames / fps)
@@ -264,6 +266,7 @@ def video_generation_thread(
     cfg: float,
     use_init_latent: bool = True,
     audio_margin: int = 2,
+    active_clips: Optional[list[int]] = None,
 ) -> None:
     """
     Unified video generation thread for 1..N GPUs.
@@ -292,13 +295,13 @@ def video_generation_thread(
         _run_multi_gpu_loop(
             gpu_manager, ref_image, prepared_queue, raw_clip_queue, stop_event,
             sample_rate, fps, clip_frames, W, H, steps, cfg, audio_margin,
-            num_gpus, K,
+            num_gpus, K, active_clips
         )
     else:
         _run_single_gpu_loop(
             gpu_manager, ref_image, prepared_queue, raw_clip_queue, stop_event,
             sample_rate, fps, clip_frames, W, H, steps, cfg,
-            use_init_latent, audio_margin,
+            use_init_latent, audio_margin, active_clips
         )
 
 
@@ -317,6 +320,7 @@ def _run_single_gpu_loop(
     cfg: float,
     use_init_latent: bool,
     audio_margin: int,
+    active_clips: list[int],
 ) -> None:
     """Single-GPU: sequential generation with init_latent continuity."""
     pipe, device = gpu_manager.get_pipeline(0)
@@ -432,6 +436,7 @@ def _run_multi_gpu_loop(
     audio_margin: int,
     num_gpus: int,
     K: int,
+    active_clips: list[int],
 ) -> None:
     """Multi-GPU: fire-and-forget dispatch with ordered output.
 
@@ -537,7 +542,7 @@ def _run_multi_gpu_loop(
                     gen_frames, W, H, sample_rate, fps, steps, cfg, audio_margin,
                     final_ctx,
                 )
-                pending.append((future, current_audio, gen_frames, gpu_idx, is_first_chunk))
+                pending.append((future, current_audio, gen_frames, gpu_idx, is_first_chunk, backlog_secs))
 
                 # After first dispatch, subsequent chunks are no longer "first"
                 if is_first_chunk:
@@ -547,7 +552,7 @@ def _run_multi_gpu_loop(
 
             # ---- Process: check if the HEAD future is done (in-order) ----
             while pending and not stop_event.is_set():
-                head_future, head_audio, head_gen_frames, head_gpu, head_was_first = pending[0]
+                head_future, head_audio, head_gen_frames, head_gpu, head_was_first, head_backlog = pending[0]
 
                 if not head_future.done():
                     break  # Head not ready yet — don't skip ahead
@@ -588,7 +593,7 @@ def _run_multi_gpu_loop(
                         tail_buffer = video_np[:, :, -K:, :, :].copy()
 
                 print(f"[GEN] GPU {head_gpu}: "
-                      f"{head_gen_frames} gen → {output_video.shape[2]} sent")
+                      f"{head_gen_frames} gen → {output_video.shape[2]} sent (Backlog: {head_backlog:.2f}s)")
 
                 raw_clip_queue.put((output_video, head_audio))
 
@@ -633,6 +638,7 @@ def _drain_pending(
                 if K > 0 and video_np.shape[2] >= K:
                     tail_buffer = video_np[:, :, -K:, :, :].copy()
 
+            print(f"[GEN] Drain: GPU {gpu_idx} - {gen_frames} gen (Backlog: {backlog:.2f}s)")
             raw_clip_queue.put((output_video, audio))
         except Exception as e:
             print(f"[GEN] Drain: GPU {gpu_idx} failed: {e}")
@@ -648,6 +654,7 @@ def postprocess_thread(
     audio_out_queue: queue.Queue,
     frame_queue: queue.Queue,
     stop_event: threading.Event,
+    active_clips: list[int],
 ) -> None:
     print("[POST] Post-processing thread started.")
     while not stop_event.is_set():
@@ -689,7 +696,9 @@ def postprocess_thread(
                 pass
 
         dt = time.perf_counter() - t0
-        print(f"[POST] {n_frames} frames post-processed in {dt*1000:.1f}ms")
+        if active_clips:
+            active_clips[0] = max(0, active_clips[0] - 1)
+        print(f"[POST] {n_frames} frames post-processed in {dt*1000:.1f}ms (Remaining clips: {active_clips[0] if active_clips else '?'})")
 
 
 # ---------------------------------------------------------------------------

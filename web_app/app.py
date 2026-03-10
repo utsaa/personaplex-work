@@ -132,6 +132,8 @@ def main() -> None:
     parser.add_argument("--overlap-frames", type=int, default=6,
                         help="Number of overlap frames (K) for multi-GPU blending. "
                              "Only used when >=2 GPUs are detected. Default: 6.")
+    parser.add_argument("--use-trt", action=argparse.BooleanOptionalAction, default=False,
+                        help="Enable TensorRT accelerated inference (disabled by default). Use --use-trt to enable.")
     
     args = parser.parse_args()
 
@@ -147,15 +149,17 @@ def main() -> None:
         weight_dtype=WEIGHT_DTYPE,
         audio_model_type=args.audio_model_type,
         overlap_frames=args.overlap_frames,
+        use_trt=args.use_trt,
+        fp8=args.quantize_fp8,
     )
 
-    # Quantization (apply to all GPUs)
-    if args.quantize_fp8:
+    # Quantization (apply to all GPUs for non-TRT path)
+    if args.quantize_fp8 and not args.use_trt:
         for i in range(gpu_manager.num_gpus):
             pipe, device = gpu_manager.get_pipeline(i)
             try:
                 from torchao.quantization import quantize_, Float8WeightOnlyConfig
-                print(f"[INIT] Quantizing Denoising UNet to FP8 on {device}...")
+                print(f"[INIT] Quantizing Denoising UNet to FP8 (PyTorch) on {device}...")
                 quantize_(pipe.denoising_unet, Float8WeightOnlyConfig())
             except ImportError:
                 try:

@@ -13,7 +13,7 @@ from src.models.whisper.audio2feature import load_audio_model
 from src.pipelines.pipeline_echomimicv2_acc import EchoMimicV2Pipeline
 from src.models.pose_encoder import PoseEncoder
 
-def load_pipeline(config_path: str, device: str, weight_dtype: torch.dtype, echomimic_dir: str, audio_model_type: str = "whisper") -> EchoMimicV2Pipeline:
+def load_pipeline(config_path: str, device: str, weight_dtype: torch.dtype, echomimic_dir: str, audio_model_type: str = "whisper", use_trt: bool = False, quantize_fp8: bool = False) -> EchoMimicV2Pipeline:
     """Load all EchoMimic-v2 ACC models and return an assembled pipeline.
     
     Args:
@@ -32,6 +32,39 @@ def load_pipeline(config_path: str, device: str, weight_dtype: torch.dtype, echo
         if os.path.isabs(path):
             return path
         return os.path.join(echomimic_dir, path)
+
+    # Resolve early — needed by both TRT and PyTorch loading paths.
+    base_path = _resolve(config.pretrained_base_model_path)
+
+    # Safety check for FP8: requires Ada Lovelace (RTX 40+) or newer
+    if quantize_fp8:
+        major, minor = torch.cuda.get_device_capability(device)
+        if major < 9:
+            print(f"[WARNING] FP8 quantization requested but GPU {device} (Capability {major}.{minor}) "
+                  f"does not support it natively. Disabling FP8 to prevent corruption.")
+            quantize_fp8 = False
+
+    # TensorRT: build engines FIRST, before loading any pipeline models.
+    # This is critical — loading models first exhausts VRAM and leaves no
+    # room for the temp UNet copy needed for ONNX tracing.
+    engine_paths = {}
+    if use_trt:
+        from core.trt.manager import TRTEngineManager
+        trt_manager = TRTEngineManager(echomimic_dir)
+        try:
+            engine_paths["unet"] = trt_manager.get_unet_engine(_resolve(config.denoising_unet_path), base_model_path=base_path, fp8=quantize_fp8)
+            engine_paths["vae_encoder"] = trt_manager.get_vae_encoder_engine(_resolve(config.pretrained_vae_path))
+            engine_paths["vae_decoder"] = trt_manager.get_vae_decoder_engine(_resolve(config.pretrained_vae_path))
+            engine_paths["reference_unet"] = trt_manager.get_ref_unet_engine(_resolve(config.reference_unet_path))
+            engine_paths["pose_encoder"] = trt_manager.get_pose_encoder_engine(_resolve(config.pose_encoder_path))
+            print(f"[INIT] TensorRT engines ready for all models.")
+        except Exception as e:
+            import traceback
+            print(f"[ERROR] Failed to prepare TensorRT engines: {e}")
+            traceback.print_exc()
+            print("[ERROR] Falling back to PyTorch for some models.")
+        # Free any temp GPU allocs from the export before loading main models
+        torch.cuda.empty_cache()
 
     # VAE
     print("  loading VAE ...")
@@ -108,6 +141,8 @@ def load_pipeline(config_path: str, device: str, weight_dtype: torch.dtype, echo
         audio_guider=audio_processor,
         pose_encoder=pose_net,
         scheduler=scheduler,
+        use_trt=use_trt,
+        engine_paths=engine_paths,
     )
     pipe = pipe.to(device, dtype=weight_dtype)
 

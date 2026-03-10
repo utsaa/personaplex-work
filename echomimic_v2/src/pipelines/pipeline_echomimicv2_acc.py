@@ -52,8 +52,25 @@ class EchoMimicV2Pipeline(DiffusionPipeline):
         image_proj_model=None,
         tokenizer=None,
         text_encoder=None,
+        use_trt=False,
+        engine_paths=None,
     ):
         super().__init__()
+        self.use_trt = use_trt
+        self.engine_paths = engine_paths or {}
+        self.trt_models = {}
+
+        if self.use_trt and self.engine_paths:
+            try:
+                from core.trt.runtime import TRTModel
+                for name, path in self.engine_paths.items():
+                    if path:
+                        print(f"[PIPELINE] Loading TensorRT engine for {name}: {path}")
+                        self.trt_models[name] = TRTModel(path)
+                print(f"[PIPELINE] TensorRT acceleration enabled for: {list(self.trt_models.keys())}")
+            except Exception as e:
+                print(f"[ERROR] Failed to initialize TensorRT models: {e}")
+                self.use_rt = False
 
         self.register_modules(
             vae=vae,
@@ -71,6 +88,9 @@ class EchoMimicV2Pipeline(DiffusionPipeline):
         self.ref_image_processor = VaeImageProcessor(
             vae_scale_factor=self.vae_scale_factor, do_convert_rgb=True
         )
+        # For managing hooks and avoid accumulation
+        self.reference_control_writer = None
+        self.reference_control_reader = None
 
     def enable_vae_slicing(self):
         self.vae.enable_slicing()
@@ -107,10 +127,17 @@ class EchoMimicV2Pipeline(DiffusionPipeline):
         video_length = latents.shape[2]
         latents = 1 / 0.18215 * latents
         latents = rearrange(latents, "b c f h w -> (b f) c h w")
-        video = []
-        for frame_idx in tqdm(range(latents.shape[0])):
-            video.append(self.vae.decode(latents[frame_idx : frame_idx + 1]).sample)
-        video = torch.cat(video)
+        
+        if self.use_trt and "vae_decoder" in self.trt_models:
+            # Full batch decode
+            out = self.trt_models["vae_decoder"].run({"latent": latents})
+            video = out["sample"]
+        else:
+            video = []
+            for frame_idx in tqdm(range(latents.shape[0])):
+                video.append(self.vae.decode(latents[frame_idx : frame_idx + 1]).sample)
+            video = torch.cat(video)
+
         video = rearrange(video, "(b f) c h w -> b c f h w", f=video_length)
         video = (video / 2 + 0.5).clamp(0, 1)
         # we always cast to float32 as this does not cause significant overhead and is compatible with bfloa16
@@ -341,7 +368,7 @@ class EchoMimicV2Pipeline(DiffusionPipeline):
             self.reference_unet,
             do_classifier_free_guidance=do_classifier_free_guidance,
             mode="write",
-            batch_size=1,  # Assuming batch size 1 for real-time
+            batch_size=ref_image_latents.shape[0],
             fusion_blocks="full",
         )
 
@@ -409,34 +436,54 @@ class EchoMimicV2Pipeline(DiffusionPipeline):
         # Handle Reference Logic (Cached vs Computed)
         if reference_cache is not None:
             # Use cached components
-            ref_image_latents = reference_cache["ref_image_latents"]
-            reference_control_writer = reference_cache["reference_control_writer"]
+            ref_image_latents = reference_cache.get("ref_image_latents")
+            reference_control_writer = reference_cache.get("reference_control_writer")
         else:
             # Compute fresh
-            reference_control_writer = ReferenceAttentionControl(
-                self.reference_unet,
-                do_classifier_free_guidance=do_classifier_free_guidance,
-                mode="write",
-                batch_size=batch_size,
-                fusion_blocks="full",
-            )
             # Prepare ref image latents
             ref_image_tensor = self.ref_image_processor.preprocess(
                 ref_image, height=height, width=width
-            )
-            ref_image_tensor = ref_image_tensor.to(
-                dtype=self.vae.dtype, device=self.vae.device
-            )
-            ref_image_latents = self.vae.encode(ref_image_tensor).latent_dist.mean
-            ref_image_latents = ref_image_latents * 0.18215
+            )  # (bs, c, width, height)
+            ref_image_tensor = ref_image_tensor.to(dtype=self.vae.dtype, device=self.vae.device)
+            
+            if self.use_trt and "vae_encoder" in self.trt_models:
+                out = self.trt_models["vae_encoder"].run({"input": ref_image_tensor})
+                ref_image_latents = out["latent"]
+            else:
+                ref_image_latents = self.vae.encode(ref_image_tensor).latent_dist.mean
+            
+            ref_image_latents = ref_image_latents * 0.18215 
+            # Initialize reference control if not already done
+            if self.reference_control_writer is None:
+                self.reference_control_writer = ReferenceAttentionControl(
+                    self.reference_unet,
+                    do_classifier_free_guidance=do_classifier_free_guidance,
+                    mode="write",
+                    batch_size=ref_image_latents.shape[0],
+                    fusion_blocks="full",
+                )
+            else:
+                # Writer exists, clear previous bank
+                self.reference_control_writer.clear()
+            
+            reference_control_writer = self.reference_control_writer
+        
+        reference_control_reader = None
+        if not (self.use_trt and "unet" in self.trt_models):
+            if self.reference_control_reader is None:
+                self.reference_control_reader = ReferenceAttentionControl(
+                    self.denoising_unet,
+                    do_classifier_free_guidance=do_classifier_free_guidance,
+                    mode="read",
+                    batch_size=batch_size,
+                    fusion_blocks="full",
+                )
+            else:
+                # Reader exists, clear previous bank
+                self.reference_control_reader.clear()
+            
+            reference_control_reader = self.reference_control_reader
 
-        reference_control_reader = ReferenceAttentionControl(
-            self.denoising_unet,
-            do_classifier_free_guidance=do_classifier_free_guidance,
-            mode="read",
-            batch_size=batch_size,
-            fusion_blocks="full",
-        )
 
         # Audio Processing
         whisper_feature = self.audio_guider.audio2feat(audio_data)
@@ -478,7 +525,11 @@ class EchoMimicV2Pipeline(DiffusionPipeline):
             init_latents=init_latents,
         )
         
-        pose_enocder_tensor = self.pose_encoder(poses_tensor)
+        if self.use_trt and "pose_encoder" in self.trt_models:
+            out = self.trt_models["pose_encoder"].run({"conditioning": poses_tensor})
+            pose_enocder_tensor = out["embedding"]
+        else:
+            pose_enocder_tensor = self.pose_encoder(poses_tensor)
         
         extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
 
@@ -523,7 +574,8 @@ class EchoMimicV2Pipeline(DiffusionPipeline):
                             encoder_hidden_states=None,
                             return_dict=False,
                         )
-                    reference_control_reader.update(reference_control_writer, do_classifier_free_guidance=do_classifier_free_guidance)
+                    if reference_control_reader:
+                        reference_control_reader.update(reference_control_writer, do_classifier_free_guidance=do_classifier_free_guidance)
 
 
                 num_context_batches = math.ceil(len(context_queue) / context_batch_size)
@@ -559,16 +611,53 @@ class EchoMimicV2Pipeline(DiffusionPipeline):
                     latent_model_input = self.scheduler.scale_model_input(
                         latent_model_input, t
                     )
-                    b, c, f, h, w = latent_model_input.shape
+                    b, c, f_len, h, w = latent_model_input.shape
                     
-                    pred = self.denoising_unet(
-                        latent_model_input,
-                        t,
-                        encoder_hidden_states=None,
-                        audio_cond_fea=audio_latents if do_classifier_free_guidance else audio_latents_cond,
-                        face_musk_fea=pose_latents if do_classifier_free_guidance else pose_latents_cond,
-                        return_dict=False,
-                    )[0]
+                    if self.use_trt and "unet" in self.trt_models:
+                        trt_unet = self.trt_models["unet"]
+                        # Prepare TRT inputs: prepend reference frame to sample
+                        # ref_image_latents shape: (1, 4, h, w)
+                        ref_latent_input = ref_image_latents.to(device=device, dtype=latent_model_input.dtype).unsqueeze(2) # (1, 4, 1, h, w)
+                        if ref_latent_input.shape[0] != latent_model_input.shape[0]:
+                            ref_latent_input = ref_latent_input.repeat(latent_model_input.shape[0], 1, 1, 1, 1)
+                        
+                        trt_sample = torch.cat([ref_latent_input, latent_model_input], dim=2)
+                        
+                        # Timestep: (B,)
+                        trt_timestep = t.expand(latent_model_input.shape[0])
+                        
+                        # Audio/Pose: need to pad for the extra reference frame
+                        b_orig = 2 if do_classifier_free_guidance else 1
+                        
+                        # Audio (B*F, 1, D) -> (B*(F+1), 1, D)
+                        audio_in = audio_latents if do_classifier_free_guidance else audio_latents_cond
+                        audio_in_res = audio_in.view(b_orig, f_len, *audio_in.shape[1:])
+                        audio_pad = torch.zeros((b_orig, 1, *audio_in.shape[1:]), device=device, dtype=audio_in.dtype)
+                        audio_trt = torch.cat([audio_pad, audio_in_res], dim=1).reshape(-1, *audio_in.shape[1:])
+                        
+                        # Pose (B, 4, F, H, W) -> (B, 4, F+1, H, W)
+                        pose_in = pose_latents if do_classifier_free_guidance else pose_latents_cond
+                        pose_pad = torch.zeros((b_orig, 4, 1, h, w), device=device, dtype=pose_in.dtype)
+                        pose_trt = torch.cat([pose_pad, pose_in], dim=2)
+                        
+                        # Execute TRT
+                        trt_out = self.trt_unet.run({
+                            "sample": trt_sample,
+                            "timestep": trt_timestep,
+                            "audio_cond_fea": audio_trt,
+                            "face_musk_fea": pose_trt
+                        })
+                        # Extract output (skip reference frame)
+                        pred = trt_out["out_sample"][:, :, 1:, :, :]
+                    else:
+                        pred = self.denoising_unet(
+                            latent_model_input,
+                            t,
+                            encoder_hidden_states=None,
+                            audio_cond_fea=audio_latents if do_classifier_free_guidance else audio_latents_cond,
+                            face_musk_fea=pose_latents if do_classifier_free_guidance else pose_latents_cond,
+                            return_dict=False,
+                        )[0]
 
                     alphas_cumprod = self.scheduler.alphas_cumprod.to(latent_model_input.device)
                     x_pred = origin_by_velocity_and_sample(pred, latent_model_input, alphas_cumprod, t)
@@ -595,9 +684,10 @@ class EchoMimicV2Pipeline(DiffusionPipeline):
                 ):
                     progress_bar.update()
 
-            reference_control_reader.clear()
+            if reference_control_reader:
+                reference_control_reader.clear()
             # Do NOT clear writer if we are caching!
-            if reference_cache is None:
+            if reference_cache is None and reference_control_writer:
                 reference_control_writer.clear()
 
         # NEW: Extract final latent (last frame) before decoding for next clip's continuity

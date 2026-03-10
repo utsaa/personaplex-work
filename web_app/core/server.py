@@ -41,6 +41,9 @@ async def run_server(
     audio_out_queue = queue.Queue(maxsize=50) # Post Proc -> WS
     frame_queue = queue.Queue(maxsize=300)    # Post Proc -> WS
     
+    # Track "in-flight" clips across all threads
+    active_clips = [0] 
+    
     stop_event = threading.Event()
 
     # 1. Input Preparation Thread (CPU)
@@ -50,6 +53,7 @@ async def run_server(
             input_queue, prepared_queue, stop_event,
             pose_provider,
             args.sample_rate, args.fps, args.clip_frames,
+            active_clips
         ),
         kwargs={
             "vad_threshold": args.vad_threshold,
@@ -67,11 +71,8 @@ async def run_server(
             gpu_manager, ref_image, prepared_queue, raw_clip_queue, stop_event,
             args.sample_rate, args.fps, args.clip_frames,
             args.width, args.height, args.steps, args.cfg,
+            args.use_init_latent, args.audio_margin, active_clips
         ),
-        kwargs={
-            "use_init_latent": args.use_init_latent,
-            "audio_margin": args.audio_margin,  
-        },
         daemon=True,
     )
     gen_thread.start()
@@ -79,7 +80,7 @@ async def run_server(
     # 3. Post-processing Thread (CPU)
     post_thread = threading.Thread(
         target=postprocess_thread,
-        args=(raw_clip_queue, audio_out_queue, frame_queue, stop_event),
+        args=(raw_clip_queue, audio_out_queue, frame_queue, stop_event, active_clips),
         daemon=True,
     )
     post_thread.start()
@@ -104,8 +105,10 @@ async def run_server(
                 break
 
         fps = args.fps
+        flush_done = False
 
         async def send_frames():
+            nonlocal flush_done
             frame_interval = 1.0 / fps
             while not ws.closed and not stop_event.is_set():
                 try:
@@ -128,6 +131,19 @@ async def run_server(
                             sent_any = True
                         except queue.Empty:
                             break
+
+                    # Signal Flush (Tag 03) ONLY if all internal GPU/CPU processing queues are empty
+                    # This ensures the client only bypasses the 60s buffer when generation is TRULY finished.
+                    if (prepared_queue.empty() and 
+                        raw_clip_queue.empty() and 
+                        frame_queue.empty() and 
+                        active_clips[0] == 0):
+                        if not flush_done:
+                            print("[WEB] Sending Flush Signal (Tag 03)")
+                            await ws.send_bytes(b'\x03')
+                            flush_done = True
+                    else:
+                        flush_done = False
 
                     if not sent_any:
                         await asyncio.sleep(frame_interval)

@@ -75,10 +75,14 @@ class MultiGPUManager:
         weight_dtype: torch.dtype,
         audio_model_type: str = "whisper",
         overlap_frames: int = 6,
+        use_trt: bool = False,
+        fp8: bool = False,
     ):
         self._num_gpus = max(1, detect_gpus())
         self.overlap_frames = overlap_frames if self._num_gpus >= 2 else 0
         self.weight_dtype = weight_dtype
+        self.use_trt = use_trt
+        self.fp8 = fp8
 
         # Per-GPU state
         self.pipes = [None] * self._num_gpus
@@ -99,7 +103,8 @@ class MultiGPUManager:
             print(f"[GPU] Loading pipeline on {self.devices[0]} ...")
             self.pipes[0] = load_pipeline(
                 config_path, self.devices[0], weight_dtype, echomimic_dir,
-                audio_model_type=audio_model_type,
+                audio_model_type=audio_model_type, use_trt=self.use_trt,
+                quantize_fp8=self.fp8
             )
         else:
             threads = []
@@ -111,6 +116,7 @@ class MultiGPUManager:
                     self.pipes[idx] = load_pipeline(
                         config_path, self.devices[idx], weight_dtype,
                         echomimic_dir, audio_model_type=audio_model_type,
+                        use_trt=self.use_trt, quantize_fp8=self.fp8
                     )
                     print(f"[GPU] Pipeline {idx} ready on {self.devices[idx]}.")
                 except Exception as e:

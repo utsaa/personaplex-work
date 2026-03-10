@@ -31,6 +31,7 @@
       border-radius: 6px;
       transition: background 0.2s;
     }
+
     #micToggle.muted {
       background: #a22;
     }
@@ -103,23 +104,51 @@
     // ---------------------------------------------------------------------------
     // Frame buffer: accumulate frames and play back at a steady FPS
     // ---------------------------------------------------------------------------
-    const TARGET_FPS = 24;
-    const MIN_BUFFER = 12;        // start playback after one full clip (12 frames at 24fps = 0.5s)
-    const MAX_BUFFER = 200;       // discard oldest if buffer grows beyond this
+    const TARGET_FPS = 24;        // Matching server default (app.py)
+    const COLD_START_SECS = 4.0; // User-requested 0.5 buffer
+    const MIN_BUFFER = Math.floor(COLD_START_SECS * TARGET_FPS);
+    const MAX_BUFFER = 2000;      // discard oldest if buffer grows beyond this
     let frameBuffer = [];         // array of blob URLs (JPEG)
+    let audioQueue = [];          // array of ArrayBuffers (float32 PCM)
     let playbackTimer = null;     // setInterval id
     let playbackStarted = false;
+    let flushReceived = false;    // New: robust bypass flag
 
     function startPlayback() {
       if (playbackTimer) return;
+
+      if (!playCtx) {
+        console.error("[PLAY] startPlayback failed: playCtx is null! WebSocket might have received frames before mic permission was granted.");
+        setStatus("Waiting for audio context...");
+        return;
+      }
+
+      console.log(`[PLAY] startPlayback called. Buffer: ${frameBuffer.length}, Audio: ${audioQueue.length}`);
+
+      if (playCtx.state === 'suspended') {
+        console.log("[PLAY] Resuming suspended AudioContext...");
+        playCtx.resume();
+      }
+
       playbackStarted = true;
+      setStatus('Playing');
+
+      // 1. Drain any buffered audio immediately
+      playNextTime = playCtx.currentTime;
+      while (audioQueue.length > 0) {
+        const payload = audioQueue.shift();
+        scheduleAudio(payload);
+      }
+
+      // 2. Start video interval
       const interval = 1000 / TARGET_FPS;
       playbackTimer = setInterval(() => {
         if (frameBuffer.length === 0) {
           // Buffer underrun — pause and wait for re-buffer
+          console.log("[PLAY] Buffer empty. Stopping playback.");
           stopPlayback();
           playbackStarted = false;
-          setStatus('Buffering...');
+          setStatus('Buffering (empty)...');
           return;
         }
         const url = frameBuffer.shift();
@@ -133,6 +162,20 @@
 
     function stopPlayback() {
       if (playbackTimer) { clearInterval(playbackTimer); playbackTimer = null; }
+    }
+
+    function scheduleAudio(payload) {
+      if (!playCtx) return;
+      const f32 = new Float32Array(payload);
+      const buf = playCtx.createBuffer(1, f32.length, 16000);
+      buf.getChannelData(0).set(f32);
+      const src = playCtx.createBufferSource();
+      src.buffer = buf;
+      src.connect(playCtx.destination);
+      const now = playCtx.currentTime;
+      if (playNextTime < now) playNextTime = now;
+      src.start(playNextTime);
+      playNextTime += buf.duration;
     }
 
     function updateBufferGauge() {
@@ -178,6 +221,7 @@
 
               if (rms >= VAD_RMS_THRESHOLD) {
                 vadHoldCounter = VAD_HOLD_CHUNKS;
+                flushReceived = false; // Reset flush state when user starts talking
                 ws.send(new Float32Array(pcm).buffer);
                 if (indicator) { indicator.textContent = 'VAD: speaking \u{1F50A}'; indicator.style.color = '#0f0'; }
               } else if (vadHoldCounter > 0) {
@@ -206,7 +250,7 @@
       };
 
       ws.onmessage = (e) => {
-        if (!(e.data instanceof ArrayBuffer) || e.data.byteLength < 2) return;
+        if (!(e.data instanceof ArrayBuffer) || e.data.byteLength < 1) return;
         const view = new Uint8Array(e.data);
         const tag = view[0];
         const payload = e.data.slice(1);
@@ -224,23 +268,30 @@
           frameBuffer.push(url);
           updateBufferGauge();
 
-          // Start playback once we have enough frames
-          if (!playbackStarted && frameBuffer.length >= MIN_BUFFER) {
-            setStatus('Playing...');
-            startPlayback();
+          // Start playback once we have enough frames OR flush arrived
+          if (!playbackStarted) {
+            if (frameBuffer.length >= MIN_BUFFER || (flushReceived && frameBuffer.length > 0)) {
+              console.log(`[BUFFER] Starting playback. Current: ${frameBuffer.length}, Threshold: ${MIN_BUFFER}, Flush: ${flushReceived}`);
+              startPlayback();
+            } else {
+              setStatus(`Buffering (${frameBuffer.length}/${MIN_BUFFER})...`);
+            }
           }
         } else if (tag === 0x02 && playCtx) {
-          // float32 PCM audio chunk — schedule for gapless playback
-          const f32 = new Float32Array(payload);
-          const buf = playCtx.createBuffer(1, f32.length, 16000);
-          buf.getChannelData(0).set(f32);
-          const src = playCtx.createBufferSource();
-          src.buffer = buf;
-          src.connect(playCtx.destination);
-          const now = playCtx.currentTime;
-          if (playNextTime < now) playNextTime = now;
-          src.start(playNextTime);
-          playNextTime += buf.duration;
+          // float32 PCM audio chunk
+          if (playbackStarted) {
+            scheduleAudio(payload);
+          } else {
+            audioQueue.push(payload);
+          }
+        } else if (tag === 0x03) {
+          // Flush signal: start playback immediately if we have any data
+          flushReceived = true;
+          if (!playbackStarted && frameBuffer.length > 0) {
+            console.log("[PLAY] Flush signal received. Bypassing buffer.");
+            setStatus('Playing (Flushed)...');
+            startPlayback();
+          }
         }
       };
 
@@ -270,9 +321,11 @@
     function cleanup() {
       stopPlayback();
       playbackStarted = false;
+      flushReceived = false;
       // Release any remaining buffered blob URLs
       for (const url of frameBuffer) URL.revokeObjectURL(url);
       frameBuffer = [];
+      audioQueue = [];
       updateBufferGauge();
       if (processor) { processor.disconnect(); processor = null; }
       if (source) { source.disconnect(); source = null; }
