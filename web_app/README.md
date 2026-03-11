@@ -86,6 +86,9 @@ pip install -e .
 
 **Run Optimized (Whisper + RTX 4090 Recommended):**
 ```bash
+uv run python app.py --port 8080 --compile-unet --compile-unet-mode reduce-overhead --quantize-fp8 --steps 6 --audio-margin 6 --use-blend --audio-model-type whisper --low-ram --cfg 1.0
+```
+```bash
 uv run python app.py --port 8080 --compile-unet --compile-unet-mode reduce-overhead --quantize-fp8 --steps 6 --audio-margin 6 --use-init-latent --audio-model-type whisper --low-ram --cfg 1.0
 ```
 ```bash
@@ -148,10 +151,15 @@ The web app includes several advanced optimizations for low-latency, real-time p
 - **Benefit:** Reduces per-frame latency by 60-70% compared to standard PyTorch.
 - **Flag:** `--use-rt` (Enabled by default).
 
-### 7. Latent State Preservation (Visual Continuity)
-- **What it does:** In single-GPU mode, initializes each new clip using the final latent of the previous clip. In multi-GPU mode, overlap-blend crossfade handles continuity instead.
+### 7. Latent State Preservation vs. Blending (Visual Continuity) ⚡
+- **What it does:** 
+  - **Single GPU (Default)**: Uses `init_latent` continuity (initializes each new clip using the final latent of the previous clip).
+  - **Single GPU (Blending)**: If `--use-blend` is active, it uses overlap-blending instead. This generates extra frames and crossfades them, providing stability at higher speeds by starting from noise. **Note: This disables init-latent.**
+  - **Multi GPU (Default)**: Blending is always on.
 - **Benefit:** Prevents the character from "resetting" or flickering between clips.
-- **Flag:** `--use-init-latent` (single-GPU only; multi-GPU uses overlap blend automatically)
+- **Flags:** 
+  - `--use-init-latent`: Traditional latent preservation (Single-GPU only).
+  - `--use-blend`: Enables overlap-blending on Single-GPU (forces `--no-use-init-latent`).
 
 ### 8. Low RAM Mode (Stability Fix)
 - **What it does:** Disables the pre-loading of pose sequences (`.npy` files) into system RAM.
@@ -163,9 +171,10 @@ The web app includes several advanced optimizations for low-latency, real-time p
 | Flag | Default | Description |
 |---|---|---|
 | `--port` | `8080` | HTTP server port |
-| `--overlap-frames` | `6` | **Multi-GPU only.** Overlap frames (K) for crossfade blending between GPU chunks. |
+| `--overlap-frames` | `6` | Overlap frames (K) for crossfade blending between GPU chunks. |
 | `--audio-margin` | `2` | **Recommended: 6**. Audio feature context margin (frames). Higher = better sync. |
-| `--use-init-latent` | `True` | Latent state preservation (single-GPU continuity). Auto-disabled for multi-GPU. |
+| `--use-init-latent` | `True` | Latent state preservation (single-GPU continuity). Auto-disabled if `--use-blend` or multi-GPU active. |
+| `--use-blend` | `False` | **Single-GPU only.** Enables overlap-blending on one GPU (disables init-latent). |
 | `--compile-unet` | `False` | **Recommended**. Compiles UNet for faster inference (adds startup delay). |
 | `--compile-unet-mode` | `reduce-overhead` | Compilation strategy: `default`, `reduce-overhead`, `max-autotune`. |
 | `--quantize-fp8` | `False` | Quantize UNet to FP8 (requires L4/H100/4090). ~1.8x speedup. |

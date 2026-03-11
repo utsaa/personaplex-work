@@ -134,10 +134,17 @@ def main() -> None:
                              "Only used when >=2 GPUs are detected. Default: 6.")
     parser.add_argument("--use-trt", action=argparse.BooleanOptionalAction, default=False,
                         help="Enable TensorRT accelerated inference (disabled by default). Use --use-trt to enable.")
+    parser.add_argument("--use-blend", action=argparse.BooleanOptionalAction, default=False,
+                        help="Enable overlap-blending on single GPU (disables init-latent).")
     
     args = parser.parse_args()
 
     setup_logging()
+    print(f"[INIT] Arguments: {args}")
+
+    if getattr(args, "use_blend", False):
+        print("[INIT] --use-blend active. Disabling --use-init-latent for temporal stability.")
+        args.use_init_latent = False
 
     # GPU Detection & Pipeline Loading
     n_gpus = detect_gpus()
@@ -151,6 +158,7 @@ def main() -> None:
         overlap_frames=args.overlap_frames,
         use_trt=args.use_trt,
         fp8=args.quantize_fp8,
+        force_blend=args.use_blend,
     )
 
     # Quantization (apply to all GPUs for non-TRT path)

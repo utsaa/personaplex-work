@@ -77,9 +77,11 @@ class MultiGPUManager:
         overlap_frames: int = 6,
         use_trt: bool = False,
         fp8: bool = False,
+        force_blend: bool = False,
     ):
         self._num_gpus = max(1, detect_gpus())
-        self.overlap_frames = overlap_frames if self._num_gpus >= 2 else 0
+        # Blending is always on for multi-GPU, or if forced for single-GPU
+        self.overlap_frames = overlap_frames if (self._num_gpus >= 2 or force_blend) else 0
         self.weight_dtype = weight_dtype
         self.use_trt = use_trt
         self.fp8 = fp8
@@ -90,7 +92,7 @@ class MultiGPUManager:
         self.reference_caches = [None] * self._num_gpus
         # For single-GPU mode: sequential latent continuity
         self.last_latents = [None] * self._num_gpus
-        # For multi-GPU mode: tail frames buffer per GPU (last K decoded frames)
+        # For multi-GPU (or blending) mode: tail frames buffer per GPU (last K decoded frames)
         self.tail_buffers: list[Optional[np.ndarray]] = [None] * self._num_gpus
 
         print(f"[GPU] Detected {self._num_gpus} CUDA GPU(s). "

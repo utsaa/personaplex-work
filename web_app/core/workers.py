@@ -97,9 +97,9 @@ def input_preparation_thread(
     consecutive_silent_clips = 0
     idle_clips_limit = max(1, int(1.0 * fps / clip_frames))
     
-    # State for empty-audio flushing
     has_flushed = False
     should_reset_after_flush = False
+    empty_flush_count = 0
 
     print(f"[PREP] Waiting for audio (target clip: {samples_per_clip} samples) ...")
     print(f"[PREP] Audio Context: {history_samples/sample_rate:.2f}s history + "
@@ -152,6 +152,7 @@ def input_preparation_thread(
             
             has_flushed = False
             consecutive_silent_clips = 0
+            empty_flush_count = 0
 
             # Prepare Inputs
             # Create full window for model context: 2.0s history + current + (optional) silence
@@ -197,7 +198,11 @@ def input_preparation_thread(
                     pose_provider, pose_idx, prepared_queue
                 )
                 has_flushed = True
-                should_reset_after_flush = True
+                empty_flush_count += 1
+                # Only reset after 3 consecutive empty/silent flushes
+                if empty_flush_count >= 1:
+                    should_reset_after_flush = True
+                    empty_flush_count = 0
             
             # Wait a bit if not enough audio
             time.sleep(0.005)
@@ -226,7 +231,18 @@ def generate_video_clip(
     audio_context_frames: int = 0,
 ) -> tuple[Optional[np.ndarray], Optional[torch.Tensor]]:
     """Wraps pipeline call."""
+    if init_latent is not None and use_init_latent:
+        print(f"[GEN]   (Pipeline) Using provided init_latent (Temporal Continuity ON)")
+    else:
+        print(f"[GEN]   (Pipeline) No init_latent used (Temporal Continuity OFF)")
     generator = torch.manual_seed(random.randint(0, 2**32 - 1))
+    # Extend poses if shorter than clip_frames
+    actual_pose_frames = poses_tensor.shape[2]
+    if actual_pose_frames < clip_frames:
+        pad_count = clip_frames - actual_pose_frames
+        pad = poses_tensor[:, :, -1:, :, :].repeat(1, 1, pad_count, 1, 1)
+        poses_tensor = torch.cat([poses_tensor, pad], dim=2)
+
     result = pipe(
         ref_image, audio_data,
         poses_tensor[:, :, :clip_frames, ...],
@@ -289,7 +305,7 @@ def video_generation_thread(
     tail_buffer: Optional[np.ndarray] = None
 
     print(f"[GEN] Video generation started — {num_gpus} GPU(s), "
-          f"overlap K={K}, clip_frames={clip_frames}")
+          f"overlap K={K}, clip_frames={clip_frames}, init_latent={use_init_latent}")
 
     if is_multi:
         _run_multi_gpu_loop(
@@ -301,7 +317,7 @@ def video_generation_thread(
         _run_single_gpu_loop(
             gpu_manager, ref_image, prepared_queue, raw_clip_queue, stop_event,
             sample_rate, fps, clip_frames, W, H, steps, cfg,
-            use_init_latent, audio_margin, active_clips
+            use_init_latent, audio_margin, active_clips, K
         )
 
 
@@ -321,10 +337,26 @@ def _run_single_gpu_loop(
     use_init_latent: bool,
     audio_margin: int,
     active_clips: list[int],
+    K: int = 0,
 ) -> None:
-    """Single-GPU: sequential generation with init_latent continuity."""
+    """Single-GPU: sequential generation with optional blend or latent continuity."""
     pipe, device = gpu_manager.get_pipeline(0)
     ref_cache = gpu_manager.reference_caches[0]
+
+    is_first_chunk = True
+    tail_buffer: Optional[np.ndarray] = None
+    prev_current_audio: Optional[np.ndarray] = None
+
+    samples_per_clip = int(sample_rate * clip_frames / fps)
+    k_samples = int(sample_rate * K / fps)
+
+    if K > 0:
+        print(f"[GEN] Single-GPU Blending enabled (K={K}, Init-Latent disabled).")
+        use_init_latent = False
+    elif use_init_latent:
+        print(f"[GEN] Latent continuity (init-latent) enabled.")
+    else:
+        print(f"[GEN] Latent continuity (init-latent) disabled.")
 
     while not stop_event.is_set():
         try:
@@ -337,10 +369,11 @@ def _run_single_gpu_loop(
 
         if reset_latent:
             gpu_manager.last_latents[0] = None
-            print("[GEN] Pipeline reset due to silence.")
+            tail_buffer = None
+            prev_current_audio = None
+            is_first_chunk = True
+            print("[GEN] GPU 0: Pipelines and latents reset due to silence/signal.")
 
-        # Real-time backlog: items in prepared_queue + what's already being processed
-        # Since we just took one item out, the backlog is qsize * duration
         backlog_secs = prepared_queue.qsize() * (clip_frames / fps)
         print(f"[GEN] {backlog_secs:.2f}s of audio waiting (GPU time).")
 
@@ -348,24 +381,90 @@ def _run_single_gpu_loop(
             t0 = time.perf_counter()
             init_latent = gpu_manager.last_latents[0]
 
+            # Determine frames and audio: ALWAYS use clip_frames + K if K > 0 
+            # to keep shapes constant for torch.compile / CUDA Graphs.
+            if K > 0:
+                gen_frames = clip_frames + K
+                if is_first_chunk:
+                    # First chunk: pad audio with repeat to reach gen_frames
+                    if len(audio_data) >= samples_per_clip:
+                        # repeat the last samples_per_clip effectively (or just last bit)
+                        k_audio_pad = audio_data[-k_samples:] if len(audio_data) >= k_samples else np.zeros(k_samples, dtype=np.float32)
+                        final_audio = np.concatenate([audio_data, k_audio_pad])
+                    else:
+                        final_audio = audio_data
+                    final_ctx = ctx_frames
+                else:
+                    # Subsequent: k_audio + current_audio
+                    if prev_current_audio is not None and len(prev_current_audio) >= k_samples:
+                        k_audio = prev_current_audio[-k_samples:]
+                    else:
+                        k_audio = np.zeros(k_samples, dtype=np.float32)
+
+                    if len(audio_data) > samples_per_clip:
+                        history_part = audio_data[:-samples_per_clip]
+                        current_part = audio_data[-samples_per_clip:]
+                    else:
+                        history_part = np.array([], dtype=np.float32)
+                        current_part = audio_data
+
+                    final_audio = np.concatenate([history_part, k_audio, current_part])
+                    final_ctx = ctx_frames
+                
+                prev_current_audio = current_audio.copy()
+            else:
+                gen_frames = clip_frames
+                final_audio = audio_data
+                final_ctx = ctx_frames
+
+            # Retrieve previous latent if available and enabled
+            latent_to_use = gpu_manager.last_latents[0] if use_init_latent else None
+            if latent_to_use is not None:
+                print(f"[GEN] GPU 0: Using previous latent for continuity.")
+
             video_np, final_latent = generate_video_clip(
-                pipe, ref_image, audio_data, poses_tensor,
-                W, H, clip_frames, sample_rate, fps, steps, cfg,
-                init_latent=init_latent,
+                pipe, ref_image, final_audio, poses_tensor,
+                W, H, gen_frames, sample_rate, fps, steps, cfg,
+                init_latent=latent_to_use,
                 use_init_latent=use_init_latent,
                 audio_margin=audio_margin,
                 reference_cache=ref_cache,
-                audio_context_frames=ctx_frames,
+                audio_context_frames=final_ctx,
             )
 
-            if use_init_latent:
+            if use_init_latent and final_latent is not None:
                 gpu_manager.last_latents[0] = final_latent
+                print(f"[GEN] GPU 0: New latent stored for next chunk.")
 
             dt = time.perf_counter() - t0
-            print(f"[GEN] Clip generated in {dt:.2f}s")
-
+            
             if video_np is not None:
-                raw_clip_queue.put((video_np, current_audio))
+                # Apply blending if K > 0
+                if K > 0:
+                    if is_first_chunk:
+                        # First chunk: output only first clip_frames, save tail K
+                        output_video = video_np[:, :, :clip_frames, :, :]
+                        if video_np.shape[2] >= gen_frames:
+                            tail_buffer = video_np[:, :, -K:, :, :].copy()
+                        is_first_chunk = False
+                    else:
+                        if tail_buffer is not None:
+                            blended = blend_overlap(tail_buffer, video_np, K)
+                            output_video = np.concatenate([
+                                blended,
+                                video_np[:, :, K:gen_frames, :, :]
+                            ], axis=2)
+                            output_video = output_video[:, :, -clip_frames:, :, :]
+                        else:
+                            output_video = video_np[:, :, -clip_frames:, :, :]
+                        
+                        if video_np.shape[2] >= gen_frames:
+                            tail_buffer = video_np[:, :, -K:, :, :].copy()
+                else:
+                    output_video = video_np
+
+            print(f"[GEN] Clip generated in {dt:.2f}s ({output_video.shape[2]} frames)")
+            raw_clip_queue.put((output_video, current_audio))
 
         except Exception as e:
             print(f"[GEN] Error: {e}")
@@ -397,17 +496,9 @@ def _gpu_generate_task(
     pipe, device = gpu_manager.get_pipeline(gpu_idx)
     ref_cache = gpu_manager.reference_caches[gpu_idx % gpu_manager.num_gpus]
 
-    # Extend poses if shorter than gen_frames
-    actual_pose_frames = poses_tensor.shape[2]
-    if actual_pose_frames < gen_frames:
-        pad = poses_tensor[:, :, -1:, :, :].repeat(
-            1, 1, gen_frames - actual_pose_frames, 1, 1
-        )
-        poses_tensor = torch.cat([poses_tensor, pad], dim=2)
-
     video_np, _ = generate_video_clip(
         pipe, ref_image, audio_data,
-        poses_tensor[:, :, :gen_frames, ...],
+        poses_tensor,
         W=W, H=H,
         clip_frames=gen_frames, sample_rate=sample_rate, fps=fps,
         steps=steps, cfg=cfg,
@@ -490,7 +581,7 @@ def _run_multi_gpu_loop(
                     tail_buffer = None
                     prev_current_audio = None
                     pending.clear()
-                    print("[GEN] Pipeline reset due to silence.")
+                    print("[GEN] GPU 0-N: Pipelines and latents reset due to silence/signal.")
 
                 # Real-time backlog: current prepared_queue + what is already dispatched (pending)
                 q_backlog = prepared_queue.qsize() * (clip_frames / fps)
@@ -500,37 +591,42 @@ def _run_multi_gpu_loop(
 
                 gpu_idx = next_gpu % num_gpus
 
-                if is_first_chunk:
-                    # First chunk: no overlap needed (nothing to blend with).
-                    # Generate exactly clip_frames. Save tail K for next chunk.
+                # ALWAYS use gen_frames = clip_frames + K if K > 0
+                # to keep shapes constant for torch.compile / CUDA Graphs.
+                if K > 0:
+                    gen_frames = clip_frames + K
+                    if is_first_chunk:
+                        # Pad audio for the extra K frames
+                        k_audio_pad = audio_data[-k_samples:] if len(audio_data) >= k_samples else np.zeros(k_samples, dtype=np.float32)
+                        final_audio = np.concatenate([audio_data, k_audio_pad])
+                        final_ctx = ctx_frames
+                    else:
+                        # audio_data = [history (2s)][current_audio (12 frames)]
+                        # We insert K frames of PREVIOUS audio between them:
+                        # extended  = [history (2s)][prev_k_audio (K frames)][current_audio (12 frames)]
+                        # This gives the pipeline full context + 18 frames of real audio.
+
+                        # Get K frames of audio from previous batch
+                        if prev_current_audio is not None and len(prev_current_audio) >= k_samples:
+                            k_audio = prev_current_audio[-k_samples:]
+                        else:
+                            k_audio = np.zeros(k_samples, dtype=np.float32)
+
+                        # Split audio_data into history and current parts
+                        if len(audio_data) > samples_per_clip:
+                            history_part = audio_data[:-samples_per_clip]
+                            current_part = audio_data[-samples_per_clip:]
+                        else:
+                            history_part = np.array([], dtype=np.float32)
+                            current_part = audio_data
+
+                        # Reconstruct: [history][k_prev_audio][current] = ctx + K + 12 frames
+                        final_audio = np.concatenate([history_part, k_audio, current_part])
+                        final_ctx = ctx_frames  # Full context preserved
+                else:
                     gen_frames = clip_frames
                     final_audio = audio_data
                     final_ctx = ctx_frames
-                else:
-                    # Subsequent chunks: generate clip_frames + K (e.g. 18).
-                    # audio_data = [history (2s)][current_audio (12 frames)]
-                    # We insert K frames of PREVIOUS audio between them:
-                    # extended  = [history (2s)][prev_k_audio (K frames)][current_audio (12 frames)]
-                    # This gives the pipeline full context + 18 frames of real audio.
-                    gen_frames = clip_frames + K
-
-                    # Get K frames of audio from previous batch
-                    if prev_current_audio is not None and len(prev_current_audio) >= k_samples:
-                        k_audio = prev_current_audio[-k_samples:]
-                    else:
-                        k_audio = np.zeros(k_samples, dtype=np.float32)
-
-                    # Split audio_data into history and current parts
-                    if len(audio_data) > samples_per_clip:
-                        history_part = audio_data[:-samples_per_clip]
-                        current_part = audio_data[-samples_per_clip:]
-                    else:
-                        history_part = np.array([], dtype=np.float32)
-                        current_part = audio_data
-
-                    # Reconstruct: [history][k_prev_audio][current] = ctx + K + 12 frames
-                    final_audio = np.concatenate([history_part, k_audio, current_part])
-                    final_ctx = ctx_frames  # Full context preserved
 
                 # Save current audio for next iteration's K overlap
                 prev_current_audio = current_audio.copy()
@@ -571,8 +667,12 @@ def _run_multi_gpu_loop(
 
                 # ---- Blend and produce output ----
                 if head_was_first:
-                    # First chunk: send all frames, save tail
-                    output_video = video_np
+                    # First chunk: output only first clip_frames, save tail K
+                    if K > 0:
+                        output_video = video_np[:, :, :clip_frames, :, :]
+                    else:
+                        output_video = video_np
+                    
                     if K > 0 and video_np.shape[2] >= K:
                         tail_buffer = video_np[:, :, -K:, :, :].copy()
                 else:
@@ -622,7 +722,12 @@ def _drain_pending(
                 continue
 
             if was_first:
-                output_video = video_np
+                # First chunk: output only first clip_frames, save tail K
+                if K > 0:
+                    output_video = video_np[:, :, :clip_frames, :, :]
+                else:
+                    output_video = video_np
+                
                 if K > 0 and video_np.shape[2] >= K:
                     tail_buffer = video_np[:, :, -K:, :, :].copy()
             else:
