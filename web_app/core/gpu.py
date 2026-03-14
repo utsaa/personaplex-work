@@ -78,6 +78,7 @@ class MultiGPUManager:
         use_trt: bool = False,
         fp8: bool = False,
         force_blend: bool = False,
+        clip_frames: int = 12,
     ):
         self._num_gpus = max(1, detect_gpus())
         # Blending is always on for multi-GPU, or if forced for single-GPU
@@ -85,6 +86,7 @@ class MultiGPUManager:
         self.weight_dtype = weight_dtype
         self.use_trt = use_trt
         self.fp8 = fp8
+        self.clip_frames = clip_frames
 
         # Per-GPU state
         self.pipes = [None] * self._num_gpus
@@ -106,7 +108,7 @@ class MultiGPUManager:
             self.pipes[0] = load_pipeline(
                 config_path, self.devices[0], weight_dtype, echomimic_dir,
                 audio_model_type=audio_model_type, use_trt=self.use_trt,
-                quantize_fp8=self.fp8
+                quantize_fp8=self.fp8, clip_frames=self.clip_frames
             )
         else:
             threads = []
@@ -118,7 +120,7 @@ class MultiGPUManager:
                     self.pipes[idx] = load_pipeline(
                         config_path, self.devices[idx], weight_dtype,
                         echomimic_dir, audio_model_type=audio_model_type,
-                        use_trt=self.use_trt, quantize_fp8=self.fp8
+                        use_trt=self.use_trt, quantize_fp8=self.fp8, clip_frames=self.clip_frames
                     )
                     print(f"[GPU] Pipeline {idx} ready on {self.devices[idx]}.")
                 except Exception as e:

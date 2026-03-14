@@ -146,6 +146,8 @@ Thumbs.db
 *.bin
 *.pt
 *.pth
+*.onnx
+*.engine
 
 # EchoMimic-v2 pretrained weights
 pretrained_weights/

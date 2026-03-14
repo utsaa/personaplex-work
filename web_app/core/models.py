@@ -4,6 +4,9 @@ import sys
 import torch
 from omegaconf import OmegaConf
 
+# Avoid memory fragmentation
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
 # We assume `echomimic_v2` is importable. The entry point (app.py) handles sys.path
 from diffusers import AutoencoderKL, DDIMScheduler
 from diffusers.utils import is_accelerate_available
@@ -13,7 +16,7 @@ from src.models.whisper.audio2feature import load_audio_model
 from src.pipelines.pipeline_echomimicv2_acc import EchoMimicV2Pipeline
 from src.models.pose_encoder import PoseEncoder
 
-def load_pipeline(config_path: str, device: str, weight_dtype: torch.dtype, echomimic_dir: str, audio_model_type: str = "whisper", use_trt: bool = False, quantize_fp8: bool = False) -> EchoMimicV2Pipeline:
+def load_pipeline(config_path: str, device: str, weight_dtype: torch.dtype, echomimic_dir: str, audio_model_type: str = "whisper", use_trt: bool = False, quantize_fp8: bool = False, clip_frames: int = 12) -> EchoMimicV2Pipeline:
     """Load all EchoMimic-v2 ACC models and return an assembled pipeline.
     
     Args:
@@ -49,14 +52,16 @@ def load_pipeline(config_path: str, device: str, weight_dtype: torch.dtype, echo
     # room for the temp UNet copy needed for ONNX tracing.
     engine_paths = {}
     if use_trt:
+        torch.cuda.empty_cache() # Clear before building
         from core.trt.manager import TRTEngineManager
         trt_manager = TRTEngineManager(echomimic_dir)
         try:
-            engine_paths["unet"] = trt_manager.get_unet_engine(_resolve(config.denoising_unet_path), base_model_path=base_path, fp8=quantize_fp8)
+            engine_paths["unet"] = trt_manager.get_unet_engine(_resolve(config.denoising_unet_path), base_model_path=base_path, fp8=quantize_fp8, clip_frames=clip_frames)
             engine_paths["vae_encoder"] = trt_manager.get_vae_encoder_engine(_resolve(config.pretrained_vae_path))
             engine_paths["vae_decoder"] = trt_manager.get_vae_decoder_engine(_resolve(config.pretrained_vae_path))
             engine_paths["reference_unet"] = trt_manager.get_ref_unet_engine(_resolve(config.reference_unet_path))
             engine_paths["pose_encoder"] = trt_manager.get_pose_encoder_engine(_resolve(config.pose_encoder_path))
+            torch.cuda.empty_cache()
             print(f"[INIT] TensorRT engines ready for all models.")
         except Exception as e:
             import traceback

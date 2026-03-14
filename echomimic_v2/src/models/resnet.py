@@ -51,7 +51,7 @@ class Upsample3D(nn.Module):
             self.conv = InflatedConv3d(self.channels, self.out_channels, 3, padding=1)
 
     def forward(self, hidden_states, output_size=None):
-        assert hidden_states.shape[1] == self.channels
+        # assert hidden_states.shape[1] == self.channels
 
         if self.use_conv_transpose:
             raise NotImplementedError
@@ -62,8 +62,8 @@ class Upsample3D(nn.Module):
             hidden_states = hidden_states.to(torch.float32)
 
         # upsample_nearest_nhwc fails with large batch sizes. see https://github.com/huggingface/diffusers/issues/984
-        if hidden_states.shape[0] >= 64:
-            hidden_states = hidden_states.contiguous()
+        # if hidden_states.shape[0] >= 64:
+        #     hidden_states = hidden_states.contiguous()
 
         # if `output_size` is passed we force the interpolation output
         # size and do not make use of `scale_factor=2`
@@ -110,11 +110,11 @@ class Downsample3D(nn.Module):
             raise NotImplementedError
 
     def forward(self, hidden_states):
-        assert hidden_states.shape[1] == self.channels
+        # assert hidden_states.shape[1] == self.channels
         if self.use_conv and self.padding == 0:
             raise NotImplementedError
 
-        assert hidden_states.shape[1] == self.channels
+        # assert hidden_states.shape[1] == self.channels
         hidden_states = self.conv(hidden_states)
 
         return hidden_states

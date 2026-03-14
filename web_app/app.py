@@ -159,6 +159,7 @@ def main() -> None:
         use_trt=args.use_trt,
         fp8=args.quantize_fp8,
         force_blend=args.use_blend,
+        clip_frames=args.clip_frames,
     )
 
     # Quantization (apply to all GPUs for non-TRT path)

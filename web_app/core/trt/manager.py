@@ -12,10 +12,16 @@ class TRTEngineManager:
         self.gpu_cache = os.path.join(self.cache_base, self.gpu_name)
         os.makedirs(self.gpu_cache, exist_ok=True)
 
-    def get_unet_engine(self, unet_pt_path, base_model_path=None, force_rebuild=False, fp8=False):
-        """Gets the path to a compiled UNet engine."""
-        return self._get_engine("denoising_unet_acc", unet_pt_path, force_rebuild, 
-                               extra_args={"base_model_path": base_model_path, "fp8": fp8})
+    def get_unet_engine(self, unet_pt_path, base_model_path=None, force_rebuild=False, fp8=False, clip_frames=12, video_length=25):
+        """Gets the path to a compiled UNet engine.
+        
+        Args:
+            clip_frames: Number of audio clip frames (excl. reference). Matches fps * audio_margin.
+            video_length: Maximum video length in frames.
+        """
+        return self._get_engine("denoising_unet_acc", unet_pt_path, force_rebuild,
+                               extra_args={"base_model_path": base_model_path, "fp8": fp8,
+                                           "clip_frames": clip_frames, "video_length": video_length})
 
     def get_vae_encoder_engine(self, vae_path, force_rebuild=False):
         return self._get_engine("vae_encoder", vae_path, force_rebuild)
@@ -33,10 +39,15 @@ class TRTEngineManager:
         extra_args = extra_args or {}
         fp8 = extra_args.get("fp8", False)
         
-        # Suffix engine path if FP8 is used to avoid cache collisions
+        # Suffix engine path if FP8 or specific clip_frames are used
         engine_name = model_name
         if fp8:
             engine_name += "_fp8"
+        if model_name == "denoising_unet_acc":
+            clip_frames = extra_args.get("clip_frames", 12)
+            height = extra_args.get("height", 512)
+            width = extra_args.get("width", 512)
+            engine_name += f"_f{clip_frames}_{height}x{width}"
             
         engine_path = os.path.join(self.gpu_cache, f"{engine_name}.engine")
         if os.path.exists(engine_path) and not force_rebuild:
@@ -49,26 +60,43 @@ class TRTEngineManager:
         if model_name == "denoising_unet_acc":
             from .export_unet import export_unet_to_onnx
             onnx_path = os.path.join(onnx_dir, f"{engine_name}.onnx")
+            sim_onnx_path = os.path.join(onnx_dir, f"{engine_name}_sim.onnx")
             base_model_path = extra_args.get("base_model_path")
-            export_unet_to_onnx(pt_path, onnx_path, self.echomimic_dir, base_model_path=base_model_path, quantize_fp8=fp8)
-            build_unet_engine(onnx_path, engine_path, fp8=fp8)
+            clip_frames = extra_args.get("clip_frames", 12)
+            video_length = extra_args.get("video_length", 25)
+            height = extra_args.get("height", 512)
+            width = extra_args.get("width", 512)
+            
+            # Export if the un-simplified onnx doesn't exist (we will simplify it externally or below)
+            if not os.path.exists(sim_onnx_path):
+                if not os.path.exists(onnx_path):
+                    export_unet_to_onnx(pt_path, onnx_path, self.echomimic_dir, base_model_path=base_model_path, quantize_fp8=fp8, clip_frames=clip_frames, height=height, width=width)
+                
+                # Simplify the ONNX graph before building TRT engine
+                print(f"[ONNX] Simplifying {onnx_path} to {sim_onnx_path}...")
+                import subprocess
+                import sys
+                subprocess.run(
+                    [sys.executable, "-m", "onnxsim", onnx_path, sim_onnx_path],
+                    check=True
+                )
+            
+            build_unet_engine(sim_onnx_path, engine_path, clip_frames=clip_frames, video_length=video_length, height=height, width=width, fp8=fp8)
             
         elif model_name.startswith("vae"):
             from .export_vae import export_vae_to_onnx
             export_vae_to_onnx(pt_path, onnx_dir) # Exports both encoder and decoder
-            # We need to build specifically
             encoder_onnx = os.path.join(onnx_dir, "vae_encoder.onnx")
             decoder_onnx = os.path.join(onnx_dir, "vae_decoder.onnx")
             encoder_engine = os.path.join(onnx_dir, "vae_encoder.engine")
             decoder_engine = os.path.join(onnx_dir, "vae_decoder.engine")
-            
-            # Simple build for VAE (add dedicated helper in builder.py if needed)
-            builder = TRTEngineBuilder()
-            builder.build_engine(encoder_onnx, encoder_engine, dynamic_shapes={
+
+            # Each builder must have its own network — sharing a network between two builds corrupts both engines.
+            TRTEngineBuilder().build_engine(encoder_onnx, encoder_engine, dynamic_shapes={
                 "input": [(1, 3, 512, 512), (1, 3, 512, 512), (2, 3, 512, 512)]
             })
-            builder.build_engine(decoder_onnx, decoder_engine, dynamic_shapes={
-                "latent": [(1, 4, 64, 64), (1, 4, 64, 64), (25, 4, 64, 64)] # Batch = num_frames
+            TRTEngineBuilder().build_engine(decoder_onnx, decoder_engine, dynamic_shapes={
+                "latent": [(1, 4, 64, 64), (1, 4, 64, 64), (25, 4, 64, 64)]
             })
             return encoder_engine if "encoder" in model_name else decoder_engine
 

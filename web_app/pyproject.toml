@@ -30,7 +30,11 @@ dependencies = [
     "torchao",
     "triton-windows < 3.7; sys_platform == 'win32'",
     "psutil>=7.2.2",
-    "tensorrt>=10.15.1.29",
+    "tensorrt-cu12>=10.4.0",
+    "onnx",
+    "onnxruntime-gpu",
+    "onnxscript>=0.6.3.dev20260312",
+    "onnxsim<0.4.34",
 ]
 
 [project.optional-dependencies]

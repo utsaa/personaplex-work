@@ -2,7 +2,8 @@ version = 1
 revision = 3
 requires-python = "==3.11.9"
 resolution-markers = [
-    "sys_platform == 'win32'",
+    "platform_machine != 's390x' and sys_platform == 'win32'",
+    "platform_machine == 's390x' and sys_platform == 'win32'",
     "platform_machine == 'x86_64' and sys_platform == 'linux'",
 ]
 supported-markers = [
@@ -699,6 +700,20 @@ wheels = [
 ]
 
 [[package]]
+name = "ml-dtypes"
+version = "0.5.4"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "numpy", marker = "(platform_machine == 'x86_64' and sys_platform == 'linux') or sys_platform == 'win32'" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/0e/4a/c27b42ed9b1c7d13d9ba8b6905dece787d6259152f2309338aed29b2447b/ml_dtypes-0.5.4.tar.gz", hash = "sha256:8ab06a50fb9bf9666dd0fe5dfb4676fa2b0ac0f31ecff72a6c3af8e22c063453", size = 692314, upload-time = "2025-11-17T22:32:31.031Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/a9/80/19189ea605017473660e43762dc853d2797984b3c7bf30ce656099add30c/ml_dtypes-0.5.4-cp311-cp311-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:19b9a53598f21e453ea2fbda8aa783c20faff8e1eeb0d7ab899309a0053f1483", size = 5034975, upload-time = "2025-11-17T22:31:42.758Z" },
+    { url = "https://files.pythonhosted.org/packages/b4/24/70bd59276883fdd91600ca20040b41efd4902a923283c4d6edcb1de128d2/ml_dtypes-0.5.4-cp311-cp311-win_amd64.whl", hash = "sha256:7c23c54a00ae43edf48d44066a7ec31e05fdc2eee0be2b8b50dd1903a1db94bb", size = 210742, upload-time = "2025-11-17T22:31:44.068Z" },
+    { url = "https://files.pythonhosted.org/packages/a0/c9/64230ef14e40aa3f1cb254ef623bf812735e6bec7772848d19131111ac0d/ml_dtypes-0.5.4-cp311-cp311-win_arm64.whl", hash = "sha256:557a31a390b7e9439056644cb80ed0735a6e3e3bb09d67fd5687e4b04238d1de", size = 160709, upload-time = "2025-11-17T22:31:46.557Z" },
+]
+
+[[package]]
 name = "more-itertools"
 version = "10.8.0"
 source = { registry = "https://pypi.org/simple" }
@@ -942,6 +957,38 @@ wheels = [
 ]
 
 [[package]]
+name = "onnx"
+version = "1.21.0rc1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "ml-dtypes", marker = "(platform_machine == 'x86_64' and sys_platform == 'linux') or sys_platform == 'win32'" },
+    { name = "numpy", marker = "(platform_machine == 'x86_64' and sys_platform == 'linux') or sys_platform == 'win32'" },
+    { name = "protobuf", marker = "(platform_machine == 'x86_64' and sys_platform == 'linux') or sys_platform == 'win32'" },
+    { name = "typing-extensions", marker = "(platform_machine == 'x86_64' and sys_platform == 'linux') or sys_platform == 'win32'" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/60/73/420eb8a17bcddd1e5d6dfaff434555a6208581ed225879ea84632ddb89e5/onnx-1.21.0rc1.tar.gz", hash = "sha256:509ce5e22ecdc3961b19d29e495136c329065af1bcb1c9129cebfbb5216625b1", size = 12075111, upload-time = "2026-03-06T20:46:25.701Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/da/71/172ec59d007c5a61b05ddf66d3a2d749114bb1f23bcb35ad7fc62f50e9a8/onnx-1.21.0rc1-cp311-cp311-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:8283e7dc368f3e40b719b86f945eeef9df7a096031b388412dd6f4ab47fec3ea", size = 17613419, upload-time = "2026-03-06T20:45:52.532Z" },
+    { url = "https://files.pythonhosted.org/packages/ec/85/164945530df3893a5557edf29cd59bbb6674c8a568fadd7b2707678988b0/onnx-1.21.0rc1-cp312-abi3-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:775c229ca269c549f4848a61f759108d22470725e34a461cb3caf21eefc8483e", size = 17610258, upload-time = "2026-03-06T20:46:02.919Z" },
+]
+
+[[package]]
+name = "onnx-ir"
+version = "0.2.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "ml-dtypes", marker = "(platform_machine == 'x86_64' and sys_platform == 'linux') or sys_platform == 'win32'" },
+    { name = "numpy", marker = "(platform_machine == 'x86_64' and sys_platform == 'linux') or sys_platform == 'win32'" },
+    { name = "onnx", marker = "(platform_machine == 'x86_64' and sys_platform == 'linux') or sys_platform == 'win32'" },
+    { name = "sympy", marker = "(platform_machine == 'x86_64' and sys_platform == 'linux') or sys_platform == 'win32'" },
+    { name = "typing-extensions", marker = "(platform_machine == 'x86_64' and sys_platform == 'linux') or sys_platform == 'win32'" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/b2/a5/acc43c8fa6edbc584d127fb6bbd13ae9ebfc01b9675c74e0da2de15fa4a6/onnx_ir-0.2.0.tar.gz", hash = "sha256:8bad3906691987290789b26d05e0dbff467029a0b1e411e12e4cae02e43503e4", size = 141693, upload-time = "2026-02-24T02:31:10.998Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/4a/df/a99736bcca6b16e36c687ce4996abcf4ce73c514fddd9e730cfcb6a334f2/onnx_ir-0.2.0-py3-none-any.whl", hash = "sha256:eb14d1399c2442bd1ff702719e70074e9cedfa3af5729416a32752c9e0f82591", size = 164100, upload-time = "2026-02-24T02:31:09.454Z" },
+]
+
+[[package]]
 name = "onnxruntime"
 version = "1.20.1"
 source = { registry = "https://pypi.org/simple" }
@@ -957,6 +1004,54 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/11/ac/4120dfb74c8e45cce1c664fc7f7ce010edd587ba67ac41489f7432eb9381/onnxruntime-1.20.1-cp311-cp311-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:5eec64c0269dcdb8d9a9a53dc4d64f87b9e0c19801d9321246a53b7eb5a7d1bc", size = 13331703, upload-time = "2024-11-21T00:48:57.97Z" },
     { url = "https://files.pythonhosted.org/packages/12/f1/cefacac137f7bb7bfba57c50c478150fcd3c54aca72762ac2c05ce0532c1/onnxruntime-1.20.1-cp311-cp311-win32.whl", hash = "sha256:a19bc6e8c70e2485a1725b3d517a2319603acc14c1f1a017dda0afe6d4665b41", size = 9813977, upload-time = "2024-11-21T00:49:00.519Z" },
     { url = "https://files.pythonhosted.org/packages/2c/2d/2d4d202c0bcfb3a4cc2b171abb9328672d7f91d7af9ea52572722c6d8d96/onnxruntime-1.20.1-cp311-cp311-win_amd64.whl", hash = "sha256:8508887eb1c5f9537a4071768723ec7c30c28eb2518a00d0adcd32c89dea3221", size = 11329895, upload-time = "2024-11-21T00:49:03.845Z" },
+]
+
+[[package]]
+name = "onnxruntime-gpu"
+version = "1.20.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "coloredlogs", marker = "(platform_machine == 'x86_64' and sys_platform == 'linux') or sys_platform == 'win32'" },
+    { name = "flatbuffers", marker = "(platform_machine == 'x86_64' and sys_platform == 'linux') or sys_platform == 'win32'" },
+    { name = "numpy", marker = "(platform_machine == 'x86_64' and sys_platform == 'linux') or sys_platform == 'win32'" },
+    { name = "packaging", marker = "(platform_machine == 'x86_64' and sys_platform == 'linux') or sys_platform == 'win32'" },
+    { name = "protobuf", marker = "(platform_machine == 'x86_64' and sys_platform == 'linux') or sys_platform == 'win32'" },
+    { name = "sympy", marker = "(platform_machine == 'x86_64' and sys_platform == 'linux') or sys_platform == 'win32'" },
+]
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/e0/a5/5c2287d61f359c7342e9d59d1e3dd728a982dea85f846c7af305a801c3ca/onnxruntime_gpu-1.20.1-cp311-cp311-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:1795e8bc6f9a1488a4d51d242edc4232a5ae60ec44ab4d4b0a7c65b3d17fcbff", size = 291519550, upload-time = "2024-11-21T01:13:00.489Z" },
+    { url = "https://files.pythonhosted.org/packages/be/33/6f21ea03dc4eeaa3f049127f5f17360c38799134eefd1e524f0296b23cb4/onnxruntime_gpu-1.20.1-cp311-cp311-win_amd64.whl", hash = "sha256:1348e6a0af9e8f5e8e1cfc379b70356ea40497932f5bc7f858501fe7940794ff", size = 279698022, upload-time = "2024-11-21T00:54:09.794Z" },
+]
+
+[[package]]
+name = "onnxscript"
+version = "0.6.3.dev20260312"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "ml-dtypes", marker = "(platform_machine == 'x86_64' and sys_platform == 'linux') or sys_platform == 'win32'" },
+    { name = "numpy", marker = "(platform_machine == 'x86_64' and sys_platform == 'linux') or sys_platform == 'win32'" },
+    { name = "onnx", marker = "(platform_machine == 'x86_64' and sys_platform == 'linux') or sys_platform == 'win32'" },
+    { name = "onnx-ir", marker = "(platform_machine == 'x86_64' and sys_platform == 'linux') or sys_platform == 'win32'" },
+    { name = "packaging", marker = "(platform_machine == 'x86_64' and sys_platform == 'linux') or sys_platform == 'win32'" },
+    { name = "typing-extensions", marker = "(platform_machine == 'x86_64' and sys_platform == 'linux') or sys_platform == 'win32'" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/d2/d8/d24bb0725ce1e2a3e3c44990224bdf8812827a91f54a22e2c891d3f718c7/onnxscript-0.6.3.dev20260312.tar.gz", hash = "sha256:1d652ae4af9aa3df2e1f4f8517c30d2bd5807111ad989723616955152da6c9c7", size = 604605, upload-time = "2026-03-12T07:15:58.393Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/0c/5b/0821710fe0ec874151910ecfa97df292ef7eeef9b5f1c3133238ac0c0f22/onnxscript-0.6.3.dev20260312-py3-none-any.whl", hash = "sha256:122e029ba23a9378f222700efbe645ffb51202bb59290615ae769d1717c6cfdf", size = 706663, upload-time = "2026-03-12T07:16:00.193Z" },
+]
+
+[[package]]
+name = "onnxsim"
+version = "0.4.33"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "onnx", marker = "(platform_machine == 'x86_64' and sys_platform == 'linux') or sys_platform == 'win32'" },
+    { name = "rich", marker = "(platform_machine == 'x86_64' and sys_platform == 'linux') or sys_platform == 'win32'" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/29/ce/9de9cf0a929ef859318b8709e450564c03612be84dfa4326576d1a4cb6a5/onnxsim-0.4.33.tar.gz", hash = "sha256:fd644dde40e802f5825ea5a6e3a8d6867b199668a7d2bc423060397ce1afcff0", size = 20124486, upload-time = "2023-06-26T10:00:38.67Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/ad/69/828ad55d7854b984d2589525d9c135ebc9ad2315ceb746554c61a3665a4b/onnxsim-0.4.33-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:2c6fb8e31cb8c114f34cadd322443b5645c5a020cfd61b6abd361ca027f14e03", size = 2175467, upload-time = "2023-06-26T10:00:08.828Z" },
+    { url = "https://files.pythonhosted.org/packages/5d/55/1baa7f4849cc3e6a76554732ad44b587e90784e4a4f0ba7d963b788de6ee/onnxsim-0.4.33-cp311-cp311-win_amd64.whl", hash = "sha256:1a54be8284f27e874a87467dacb3d0606abf9c40244ab2628ed9d0eb432f20ed", size = 1241584, upload-time = "2023-06-26T10:00:10.576Z" },
 ]
 
 [[package]]
@@ -1590,38 +1685,29 @@ wheels = [
 ]
 
 [[package]]
-name = "tensorrt"
+name = "tensorrt-cu12"
 version = "10.15.1.29"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "tensorrt-cu13", marker = "(platform_machine == 'x86_64' and sys_platform == 'linux') or sys_platform == 'win32'" },
+    { name = "tensorrt-cu12-bindings", marker = "(platform_machine == 'x86_64' and sys_platform == 'linux') or sys_platform == 'win32'" },
+    { name = "tensorrt-cu12-libs", marker = "(platform_machine == 'x86_64' and sys_platform == 'linux') or sys_platform == 'win32'" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/29/8d/1b3ea6493ee07d221fdf655a936f6b9d7c4bebfad7c0fdb879440a4172ad/tensorrt-10.15.1.29.tar.gz", hash = "sha256:a78fb34aee9695b81a7485ac0648859b802ff1faaac4bde743d9c51d7493204b", size = 16701, upload-time = "2026-01-30T07:40:25.93Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/57/a7/c8d81de98428c7dd67b5b9df0e1ea21c497661b4703f946e8d84b39ad76e/tensorrt_cu12-10.15.1.29.tar.gz", hash = "sha256:d28acc4d14804cac0b50c0c1fc58c0d25cb974aa4c53cda5cfd8c4a4154c45fe", size = 19096, upload-time = "2026-01-30T07:44:47.652Z" }
 
 [[package]]
-name = "tensorrt-cu13"
-version = "10.15.1.29"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "tensorrt-cu13-bindings", marker = "(platform_machine == 'x86_64' and sys_platform == 'linux') or sys_platform == 'win32'" },
-    { name = "tensorrt-cu13-libs", marker = "(platform_machine == 'x86_64' and sys_platform == 'linux') or sys_platform == 'win32'" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/1b/0b/ff3683ddf1960227fb2c6210e92ab83c26eda92091046c123d8dfc1adc93/tensorrt_cu13-10.15.1.29.tar.gz", hash = "sha256:60edcdf1a68526732ea613c309283af036f418f6ebcbc8e18d24566b74d776e0", size = 19084, upload-time = "2026-01-30T07:42:55.055Z" }
-
-[[package]]
-name = "tensorrt-cu13-bindings"
+name = "tensorrt-cu12-bindings"
 version = "10.15.1.29"
 source = { registry = "https://pypi.org/simple" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/e2/86/79a1db2281fbe8c00a42201fee843f35878d1c311c5eb714d3946543942f/tensorrt_cu13_bindings-10.15.1.29-cp311-none-manylinux_2_28_x86_64.whl", hash = "sha256:54ce62c2489e1022d79113d2af0df516f4fac9b4e511be766b45bcfe2ee2acbb", size = 1140584, upload-time = "2026-01-29T20:59:01.185Z" },
-    { url = "https://files.pythonhosted.org/packages/94/bf/257d0acd20483f87a534a6f74b52377182c80fec3fb4fba7384f61150fc1/tensorrt_cu13_bindings-10.15.1.29-cp311-none-win_amd64.whl", hash = "sha256:99025fc7938e6da0102af53a1639e843f2343ca4e19f5c6436f3fcf7af2c118f", size = 890281, upload-time = "2026-01-29T20:59:42.445Z" },
+    { url = "https://files.pythonhosted.org/packages/3e/fb/6b36b9e71c26d4c71711610b7350088d375bc65e1370bdeb6c6e90d52f35/tensorrt_cu12_bindings-10.15.1.29-cp311-none-manylinux_2_28_x86_64.whl", hash = "sha256:394dc1e506fe40e554e9ed6ee9a892fef0897cbaa78bb77c7cb8778fd81fca02", size = 1140583, upload-time = "2026-01-29T21:15:11.196Z" },
+    { url = "https://files.pythonhosted.org/packages/5d/8d/81710a0d3516f358d2bccf0c79bb53ebd67fde94e1bf2b98bcd3b4c68836/tensorrt_cu12_bindings-10.15.1.29-cp311-none-win_amd64.whl", hash = "sha256:775d22f8425eb2484f649450d49e517d68efc48c7b381952bc523185cf8c8931", size = 890279, upload-time = "2026-01-29T21:15:10.159Z" },
 ]
 
 [[package]]
-name = "tensorrt-cu13-libs"
+name = "tensorrt-cu12-libs"
 version = "10.15.1.29"
 source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/1a/dd/745dacecd032db5720e8bacfbbb436319eb49b621142414b3abf19cafd9a/tensorrt_cu13_libs-10.15.1.29.tar.gz", hash = "sha256:d07fe8b65ce7edb94e805d0b6e9653afe742610b7d5e1b270c918bc9e58a36b1", size = 681, upload-time = "2026-01-29T20:58:43.318Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/52/b0/2306f25ea0893d0080091c75b5df55d5e0580183293b4839d66f1fcab457/tensorrt_cu12_libs-10.15.1.29.tar.gz", hash = "sha256:b2a4ad7d46e6f1a43bb413cd8efc8ecd511a365beccd75515db5f65dacab6119", size = 681, upload-time = "2026-01-29T21:13:21.179Z" }
 
 [[package]]
 name = "threadpoolctl"
@@ -1737,8 +1823,8 @@ dependencies = [
     { name = "torch", marker = "(platform_machine == 'x86_64' and sys_platform == 'linux') or sys_platform == 'win32'" },
 ]
 wheels = [
-    { url = "https://download.pytorch.org/whl/cu126/torchaudio-2.8.0%2Bcu126-cp311-cp311-manylinux_2_28_x86_64.whl", hash = "sha256:77859ec6c6a92ca3b666a3f02363a5631e9676c027fb4dce99a461a089c9962c" },
-    { url = "https://download.pytorch.org/whl/cu126/torchaudio-2.8.0%2Bcu126-cp311-cp311-win_amd64.whl", hash = "sha256:48e19338f6fd24588cd5608b21087d00b80e30ddf054d9ce83f792a4b0025d7f" },
+    { url = "https://download-r2.pytorch.org/whl/cu126/torchaudio-2.8.0%2Bcu126-cp311-cp311-manylinux_2_28_x86_64.whl", hash = "sha256:77859ec6c6a92ca3b666a3f02363a5631e9676c027fb4dce99a461a089c9962c" },
+    { url = "https://download-r2.pytorch.org/whl/cu126/torchaudio-2.8.0%2Bcu126-cp311-cp311-win_amd64.whl", hash = "sha256:48e19338f6fd24588cd5608b21087d00b80e30ddf054d9ce83f792a4b0025d7f" },
 ]
 
 [[package]]
@@ -1879,13 +1965,17 @@ dependencies = [
     { name = "nvidia-cublas-cu12", marker = "sys_platform == 'win32'" },
     { name = "nvidia-cudnn-cu12", marker = "sys_platform == 'win32'" },
     { name = "omegaconf", marker = "(platform_machine == 'x86_64' and sys_platform == 'linux') or sys_platform == 'win32'" },
+    { name = "onnx", marker = "(platform_machine == 'x86_64' and sys_platform == 'linux') or sys_platform == 'win32'" },
+    { name = "onnxruntime-gpu", marker = "(platform_machine == 'x86_64' and sys_platform == 'linux') or sys_platform == 'win32'" },
+    { name = "onnxscript", marker = "(platform_machine == 'x86_64' and sys_platform == 'linux') or sys_platform == 'win32'" },
+    { name = "onnxsim", marker = "(platform_machine == 'x86_64' and sys_platform == 'linux') or sys_platform == 'win32'" },
     { name = "openai-whisper", marker = "(platform_machine == 'x86_64' and sys_platform == 'linux') or sys_platform == 'win32'" },
     { name = "opencv-python-headless", marker = "(platform_machine == 'x86_64' and sys_platform == 'linux') or sys_platform == 'win32'" },
     { name = "pillow", marker = "(platform_machine == 'x86_64' and sys_platform == 'linux') or sys_platform == 'win32'" },
     { name = "psutil", marker = "(platform_machine == 'x86_64' and sys_platform == 'linux') or sys_platform == 'win32'" },
     { name = "safetensors", marker = "(platform_machine == 'x86_64' and sys_platform == 'linux') or sys_platform == 'win32'" },
     { name = "soundfile", marker = "(platform_machine == 'x86_64' and sys_platform == 'linux') or sys_platform == 'win32'" },
-    { name = "tensorrt", marker = "(platform_machine == 'x86_64' and sys_platform == 'linux') or sys_platform == 'win32'" },
+    { name = "tensorrt-cu12", marker = "(platform_machine == 'x86_64' and sys_platform == 'linux') or sys_platform == 'win32'" },
     { name = "torch", marker = "(platform_machine == 'x86_64' and sys_platform == 'linux') or sys_platform == 'win32'" },
     { name = "torchao", marker = "(platform_machine == 'x86_64' and sys_platform == 'linux') or sys_platform == 'win32'" },
     { name = "torchaudio", marker = "(platform_machine == 'x86_64' and sys_platform == 'linux') or sys_platform == 'win32'" },
@@ -1909,13 +1999,17 @@ requires-dist = [
     { name = "nvidia-cublas-cu12", marker = "sys_platform == 'win32'" },
     { name = "nvidia-cudnn-cu12", marker = "sys_platform == 'win32'" },
     { name = "omegaconf", specifier = "==2.3.0" },
+    { name = "onnx" },
+    { name = "onnxruntime-gpu" },
+    { name = "onnxscript", specifier = ">=0.6.3.dev20260312" },
+    { name = "onnxsim", specifier = "<0.4.34" },
     { name = "openai-whisper", specifier = "==20250625" },
     { name = "opencv-python-headless", specifier = ">=4.8" },
     { name = "pillow", specifier = ">=10.2.0,<10.3.0" },
     { name = "psutil", specifier = ">=7.2.2" },
     { name = "safetensors" },
     { name = "soundfile" },
-    { name = "tensorrt", specifier = ">=10.15.1.29" },
+    { name = "tensorrt-cu12", specifier = ">=10.4.0" },
     { name = "torch", index = "https://download.pytorch.org/whl/cu126" },
     { name = "torchao", git = "https://github.com/pytorch/ao.git" },
     { name = "torchaudio", index = "https://download.pytorch.org/whl/cu126" },
