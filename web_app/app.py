@@ -49,42 +49,61 @@ WEIGHT_DTYPE = torch.float16
 
 
 # ---------------------------------------------------------------------------
-# Run-log
+# Run-log (System FD Redirection)
 # ---------------------------------------------------------------------------
-class TeeStream:
-    """Write to both the original stream and a log file simultaneously."""
-    def __init__(self, original_stream: object, log_file: object) -> None:
-        self._original = original_stream
-        self._log = log_file
-
-    def write(self, data: str) -> None:
-        self._original.write(data)
-        self._original.flush()
-        try:
-            self._log.write(data)
-            self._log.flush()
-        except Exception:
-            pass
-
-    def flush(self) -> None:
-        self._original.flush()
-        try:
-            self._log.flush()
-        except Exception:
-            pass
-
-    def __getattr__(self, name: str) -> object:
-        return getattr(self._original, name)
-
 
 def setup_logging() -> str:
+    """
+    Redirects system file descriptors 1 (stdout) and 2 (stderr) to a log file
+    while also 'tee-ing' them back to the terminal. This ensures that
+    low-level C++ and CUDA library errors (like TensorRT) are captured in 
+    the log file, which Python-level redirection (sys.stdout) often misses.
+    """
+    import os
+    import threading
+    
     os.makedirs(LOGS_DIR, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_path = os.path.join(LOGS_DIR, f"run_{timestamp}.log")
+    
+    # Save original terminal FDs (so we can still write to them)
+    try:
+        orig_stdout_fd = os.dup(1)
+        orig_stderr_fd = os.dup(2)
+    except Exception as e:
+        print(f"[WARN] Failed to duplicate FDs: {e}. Logging may not be complete.")
+        return ""
+
     log_file = open(log_path, "w", encoding="utf-8")
-    sys.stdout = TeeStream(sys.__stdout__, log_file)
-    sys.stderr = TeeStream(sys.__stderr__, log_file)
-    print(f"[LOG] Logging to {log_path}")
+
+    def tee_fd(target_fd, original_fd, log_f):
+        r, w = os.pipe()
+        os.dup2(w, target_fd)
+        os.close(w)
+
+        def logger_thread():
+            while True:
+                try:
+                    data = os.read(r, 4096)
+                    if not data:
+                        break
+                    # Write to terminal
+                    os.write(original_fd, data)
+                    # Write to log file
+                    text = data.decode(errors='replace')
+                    log_f.write(text)
+                    log_f.flush()
+                except Exception:
+                    break
+        
+        t = threading.Thread(target=logger_thread, daemon=True)
+        t.start()
+
+    # Redirect stdout and stderr
+    tee_fd(1, orig_stdout_fd, log_file)
+    tee_fd(2, orig_stderr_fd, log_file)
+
+    print(f"[LOG] Logging system FDs to {log_path}")
     return log_path
 
 
@@ -160,6 +179,8 @@ def main() -> None:
         fp8=args.quantize_fp8,
         force_blend=args.use_blend,
         clip_frames=args.clip_frames,
+        width=args.width,
+        height=args.height,
     )
 
     # Quantization (apply to all GPUs for non-TRT path)

@@ -127,6 +127,9 @@ def export_unet_to_onnx(pt_path, onnx_path, echomimic_dir, base_model_path=None,
                 print("[TRT] [ERROR] torchao not found. Skipping FP8 quantization.")
         except Exception as e:
             print(f"[TRT] [ERROR] FP8 Quantization failed: {e}")
+    # Patch the UNet for TRT-compatible Mutual Attention and Audio Cross-Attention
+    print(f"[TRT] Patching UNet transformer blocks for TRT (video_length={clip_frames+1})...")
+    patch_transformer_for_trt(model, video_length=clip_frames+1)
 
     model.eval()
 

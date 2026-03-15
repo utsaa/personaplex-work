@@ -22,14 +22,14 @@ class VAEDecoderWrapper(nn.Module):
     def forward(self, z):
         return self.vae.decode(z).sample
 
-def export_vae_to_onnx(model_path, onnx_dir, device="cuda"):
+def export_vae_to_onnx(model_path, onnx_dir, device="cuda", height=512, width=512):
     vae = AutoencoderKL.from_pretrained(model_path, torch_dtype=torch.float16).to(device)
     vae.eval()
 
     # 1. Encoder
     encoder = VAEEncoderWrapper(vae)
-    dummy_img = torch.randn(1, 3, 512, 512, dtype=torch.float16, device=device)
-    encoder_onnx = os.path.join(onnx_dir, "vae_encoder.onnx")
+    dummy_img = torch.randn(1, 3, height, width, dtype=torch.float16, device=device)
+    encoder_onnx = os.path.join(onnx_dir, f"vae_encoder_{width}x{height}.onnx")
     torch.onnx.export(
         encoder, dummy_img, encoder_onnx,
         input_names=['input'], output_names=['latent'],
@@ -39,8 +39,9 @@ def export_vae_to_onnx(model_path, onnx_dir, device="cuda"):
 
     # 2. Decoder
     decoder = VAEDecoderWrapper(vae)
-    dummy_latent = torch.randn(1, 4, 64, 64, dtype=torch.float16, device=device)
-    decoder_onnx = os.path.join(onnx_dir, "vae_decoder.onnx")
+    h_lat, w_lat = height // 8, width // 8
+    dummy_latent = torch.randn(1, 4, h_lat, w_lat, dtype=torch.float16, device=device)
+    decoder_onnx = os.path.join(onnx_dir, f"vae_decoder_{width}x{height}.onnx")
     torch.onnx.export(
         decoder, dummy_latent, decoder_onnx,
         input_names=['latent'], output_names=['sample'],

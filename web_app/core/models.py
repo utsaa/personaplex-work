@@ -16,7 +16,7 @@ from src.models.whisper.audio2feature import load_audio_model
 from src.pipelines.pipeline_echomimicv2_acc import EchoMimicV2Pipeline
 from src.models.pose_encoder import PoseEncoder
 
-def load_pipeline(config_path: str, device: str, weight_dtype: torch.dtype, echomimic_dir: str, audio_model_type: str = "whisper", use_trt: bool = False, quantize_fp8: bool = False, clip_frames: int = 12) -> EchoMimicV2Pipeline:
+def load_pipeline(config_path: str, device: str, weight_dtype: torch.dtype, echomimic_dir: str, audio_model_type: str = "whisper", use_trt: bool = False, quantize_fp8: bool = False, clip_frames: int = 12, width: int = 512, height: int = 512, overlap_frames: int = 0) -> EchoMimicV2Pipeline:
     """Load all EchoMimic-v2 ACC models and return an assembled pipeline.
     
     Args:
@@ -53,14 +53,19 @@ def load_pipeline(config_path: str, device: str, weight_dtype: torch.dtype, echo
     engine_paths = {}
     if use_trt:
         torch.cuda.empty_cache() # Clear before building
+        import core.trt.manager
+        import importlib
+        importlib.reload(core.trt.manager)
         from core.trt.manager import TRTEngineManager
         trt_manager = TRTEngineManager(echomimic_dir)
+        # When blending is active (multi-GPU or forced), the model generates clip_frames + overlap_frames.
+        gen_frames = clip_frames + overlap_frames
         try:
-            engine_paths["unet"] = trt_manager.get_unet_engine(_resolve(config.denoising_unet_path), base_model_path=base_path, fp8=quantize_fp8, clip_frames=clip_frames)
-            engine_paths["vae_encoder"] = trt_manager.get_vae_encoder_engine(_resolve(config.pretrained_vae_path))
-            engine_paths["vae_decoder"] = trt_manager.get_vae_decoder_engine(_resolve(config.pretrained_vae_path))
-            engine_paths["reference_unet"] = trt_manager.get_ref_unet_engine(_resolve(config.reference_unet_path))
-            engine_paths["pose_encoder"] = trt_manager.get_pose_encoder_engine(_resolve(config.pose_encoder_path))
+            engine_paths["unet"] = trt_manager.get_unet_engine(_resolve(config.denoising_unet_path), base_model_path=base_path, fp8=quantize_fp8, clip_frames=gen_frames, width=width, height=height)
+            engine_paths["vae_encoder"] = trt_manager.get_vae_encoder_engine(_resolve(config.pretrained_vae_path), width=width, height=height)
+            engine_paths["vae_decoder"] = trt_manager.get_vae_decoder_engine(_resolve(config.pretrained_vae_path), width=width, height=height)
+            engine_paths["reference_unet"] = trt_manager.get_ref_unet_engine(_resolve(config.reference_unet_path), base_model_path=base_path, width=width, height=height)
+            # engine_paths["pose_encoder"] = trt_manager.get_pose_encoder_engine(_resolve(config.pose_encoder_path), width=width, height=height, clip_frames=gen_frames)
             torch.cuda.empty_cache()
             print(f"[INIT] TensorRT engines ready for all models.")
         except Exception as e:
@@ -74,7 +79,7 @@ def load_pipeline(config_path: str, device: str, weight_dtype: torch.dtype, echo
     # VAE
     print("  loading VAE ...")
     vae = AutoencoderKL.from_pretrained(
-        _resolve(config.pretrained_vae_path), local_files_only=True, torch_dtype=weight_dtype,
+        _resolve(config.pretrained_vae_path), torch_dtype=weight_dtype,
     ).to(device=device, dtype=weight_dtype)
 
     # Reference UNet (2D)

@@ -80,6 +80,8 @@ class TRTEngineBuilder:
         serialized_engine = self.builder.build_serialized_network(self.network, self.config)
 
         if serialized_engine is None:
+            # Check for specific network errors if build failed
+            print("[ERROR] TensorRT engine build failed. Check network definition or precision constraints.")
             raise RuntimeError("Failed to build TensorRT engine")
 
         os.makedirs(os.path.dirname(engine_path), exist_ok=True)
@@ -89,16 +91,9 @@ class TRTEngineBuilder:
         return engine_path
 
 
-def build_unet_engine(onnx_path, engine_path, batch_size=2, clip_frames=12, video_length=25, height=512, width=512, fp8=False):
-    """Builds a TRT engine for the UNet with correct dynamic shape profiles.
-    
-    Args:
-        clip_frames: Number of audio-driven clip frames (excludes reference frame). 
-                     Should match the app's chunk size (e.g. fps * audio_margin).
-                     Default 12 = 0.5s at 25fps.
-    """
+def build_unet_engine(onnx_path, engine_path, batch_size=2, clip_frames=12, height=512, width=512, fp8=False):
+    """Builds a TRT engine for the UNet with correct dynamic shape profiles."""
     h_lat, w_lat = height // 8, width // 8
-    # F = clip_frames + 1 reference frame.
     # F = clip_frames + 1 reference frame.
     F_val = clip_frames + 1 
 
@@ -113,3 +108,15 @@ def build_unet_engine(onnx_path, engine_path, batch_size=2, clip_frames=12, vide
 
     builder = TRTEngineBuilder()
     return builder.build_engine(onnx_path, engine_path, dynamic_shapes=dynamic_shapes, fp8=fp8)
+
+
+def build_pose_encoder_engine(onnx_path, engine_path, batch_size=1, clip_frames=12, height=512, width=512):
+    """Builds a TRT engine for the Pose Encoder with semi-static shapes."""
+    # Semi-static frames (fixed to clip_frames) to avoid InflatedConv3d conflicts.
+    # Batch is dynamic (1-2) to match UNet requirements.
+    dynamic_shapes = {
+        "conditioning": [(1, 3, clip_frames, height, width), (batch_size, 3, clip_frames, height, width), (batch_size, 3, clip_frames, height, width)]
+    }
+
+    builder = TRTEngineBuilder()
+    return builder.build_engine(onnx_path, engine_path, dynamic_shapes=dynamic_shapes)

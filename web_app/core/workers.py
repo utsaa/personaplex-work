@@ -249,7 +249,7 @@ def generate_video_clip(
         W, H, clip_frames, steps, cfg,
         generator=generator,
         audio_sample_rate=sample_rate,
-        context_frames=12, fps=fps,
+        context_frames=clip_frames, fps=fps,
         context_overlap=3, start_idx=0,
         audio_margin=audio_margin, 
         init_latents=init_latent if use_init_latent else None,

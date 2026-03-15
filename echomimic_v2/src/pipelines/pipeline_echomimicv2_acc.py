@@ -527,7 +527,7 @@ class EchoMimicV2Pipeline(DiffusionPipeline):
         
         if self.use_trt and "pose_encoder" in self.trt_models:
             out = self.trt_models["pose_encoder"].run({"conditioning": poses_tensor})
-            pose_enocder_tensor = out["embedding"]
+            pose_enocder_tensor = out["fea"]
         else:
             pose_enocder_tensor = self.pose_encoder(poses_tensor)
         
@@ -558,6 +558,7 @@ class EchoMimicV2Pipeline(DiffusionPipeline):
                     device=latents.device,
                     dtype=latents.dtype,
                 )
+                
                 counter = torch.zeros(
                     (1, 1, latents.shape[2], 1, 1),
                     device=latents.device,
@@ -568,12 +569,14 @@ class EchoMimicV2Pipeline(DiffusionPipeline):
                 # Only run if not using cache (if using cache, writer is already populated)
                 if t_i == 0:
                     if reference_cache is None:
-                        self.reference_unet(
-                            ref_image_latents,
-                            torch.zeros_like(t),
-                            encoder_hidden_states=None,
-                            return_dict=False,
-                        )
+                        # Skip PyTorch reference pass if using TRT UNet (it uses frame 0 as reference instead)
+                        if not (self.use_trt and "unet" in self.trt_models):
+                            self.reference_unet(
+                                ref_image_latents,
+                                torch.zeros_like(t),
+                                encoder_hidden_states=None,
+                                return_dict=False,
+                            )
                     if reference_control_reader:
                         reference_control_reader.update(reference_control_writer, do_classifier_free_guidance=do_classifier_free_guidance)
 
@@ -629,19 +632,24 @@ class EchoMimicV2Pipeline(DiffusionPipeline):
                         # Audio/Pose: need to pad for the extra reference frame
                         b_orig = 2 if do_classifier_free_guidance else 1
                         
-                        # Audio (B*F, 1, D) -> (B*(F+1), 1, D)
+                        # Audio (B*F, n, D) -> (B, F+1, n, D)
                         audio_in = audio_latents if do_classifier_free_guidance else audio_latents_cond
-                        audio_in_res = audio_in.view(b_orig, f_len, *audio_in.shape[1:])
-                        audio_pad = torch.zeros((b_orig, 1, *audio_in.shape[1:]), device=device, dtype=audio_in.dtype)
-                        audio_trt = torch.cat([audio_pad, audio_in_res], dim=1).reshape(-1, *audio_in.shape[1:])
+                        # Safe reshape: b_orig, f_len, n_audio, D
+                        n_audio = audio_in.shape[-2]
+                        d_audio = audio_in.shape[-1]
+                        audio_in_res = audio_in.view(b_orig, f_len, n_audio, d_audio)
+                        audio_pad = torch.zeros((b_orig, 1, n_audio, d_audio), device=device, dtype=audio_in.dtype)
+                        audio_trt = torch.cat([audio_pad, audio_in_res], dim=1) # (B, F+1, n, D)
                         
-                        # Pose (B, 4, F, H, W) -> (B, 4, F+1, H, W)
+                        # Pose (B*F, C, H, W) -> (B, C, F+1, H, W)
                         pose_in = pose_latents if do_classifier_free_guidance else pose_latents_cond
-                        pose_pad = torch.zeros((b_orig, 4, 1, h, w), device=device, dtype=pose_in.dtype)
-                        pose_trt = torch.cat([pose_pad, pose_in], dim=2)
+                        # pose_in is (B*F, 320, H, W). We want (B, 320, F, H, W)
+                        pose_in_res = pose_in.view(b_orig, f_len, 320, h, w).permute(0, 2, 1, 3, 4)
+                        pose_pad = torch.zeros((b_orig, 320, 1, h, w), device=device, dtype=pose_in.dtype)
+                        pose_trt = torch.cat([pose_pad, pose_in_res], dim=2)
                         
                         # Execute TRT
-                        trt_out = self.trt_unet.run({
+                        trt_out = trt_unet.run({
                             "sample": trt_sample,
                             "timestep": trt_timestep,
                             "audio_cond_fea": audio_trt,
