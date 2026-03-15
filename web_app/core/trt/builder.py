@@ -115,7 +115,7 @@ def build_pose_encoder_engine(onnx_path, engine_path, batch_size=1, clip_frames=
     # Semi-static frames (fixed to clip_frames) to avoid InflatedConv3d conflicts.
     # Batch is dynamic (1-2) to match UNet requirements.
     dynamic_shapes = {
-        "conditioning": [(1, 3, clip_frames, height, width), (batch_size, 3, clip_frames, height, width), (batch_size, 3, clip_frames, height, width)]
+        "conditioning": [(batch_size, 3, clip_frames, height, width), (batch_size, 3, clip_frames, height, width), (batch_size, 3, clip_frames, height, width)]
     }
 
     builder = TRTEngineBuilder()

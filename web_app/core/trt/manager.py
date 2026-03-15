@@ -71,7 +71,6 @@ class TRTEngineManager:
             sim_onnx_path = os.path.join(onnx_dir, f"{engine_name}_sim.onnx")
             base_model_path = extra_args.get("base_model_path")
             clip_frames = extra_args.get("clip_frames", 12)
-            video_length = extra_args.get("video_length", 25)
             height = extra_args.get("height", 512)
             width = extra_args.get("width", 512)
             
@@ -89,7 +88,7 @@ class TRTEngineManager:
                     check=True
                 )
             
-            build_unet_engine(sim_onnx_path, engine_path, clip_frames=clip_frames, video_length=video_length, height=height, width=width, fp8=fp8)
+            build_unet_engine(sim_onnx_path, engine_path, batch_size=2, clip_frames=clip_frames, height=height, width=width, fp8=fp8)
             
         elif model_name.startswith("vae"):
             from .export_vae import export_vae_to_onnx
