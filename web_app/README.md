@@ -92,7 +92,7 @@ uv run python app.py --port 8080 --compile-unet --compile-unet-mode reduce-overh
 uv run python app.py --port 8080 --compile-unet --compile-unet-mode reduce-overhead --quantize-fp8 --steps 6 --audio-margin 6 --use-init-latent --audio-model-type whisper --low-ram --cfg 1.0
 ```
 ```bash
-uv run python app.py --port 8080 --use-trt --steps 6 --audio-margin 6 --use-init-latent --audio-model-type whisper --low-ram --cfg 1.0
+uv run python app.py --port 8080 --use-trt --steps 6 --audio-margin 6 --use-init-latent --audio-model-type whisper --low-ram --cfg 1.1
 ```
 
 > [!NOTE]
