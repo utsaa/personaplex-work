@@ -1,6 +1,12 @@
 import os
 import tensorrt as trt
 import torch
+import gc
+from dotenv import load_dotenv
+
+# Load .env from the web_app root
+dotenv_path = os.path.join(os.path.dirname(__file__), '..', '..', '.env')
+load_dotenv(dotenv_path)
 
 
 class TRTEngineBuilder:
@@ -53,8 +59,10 @@ class TRTEngineBuilder:
                 profile.set_shape(input_name, min_shape, opt_shape, max_shape)
             self.config.add_optimization_profile(profile)
 
-        # Limit workspace to 10GB to prevent "memSize >= 0" overflow
-        self.config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, 10 * 1024**3)
+        # Get workspace limit from .env (default to 4GB)
+        workspace_gb = int(os.getenv("TRT_WORKSPACE_LIMIT", 4))
+        print(f"[TRT] Setting WORKSPACE memory pool limit to {workspace_gb}GB")
+        self.config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, workspace_gb * 1024**3)
         if hasattr(trt, 'PreviewFeature') and hasattr(trt.PreviewFeature, 'DISABLE_EXTERNAL_TACTIC_CONTROL_FOR_CORE_TIMERS'):
             self.config.set_preview_feature(trt.PreviewFeature.DISABLE_EXTERNAL_TACTIC_CONTROL_FOR_CORE_TIMERS, True)
 
@@ -88,6 +96,14 @@ class TRTEngineBuilder:
         with open(engine_path, 'wb') as f:
             f.write(serialized_engine)
         print(f"[TRT] Engine built successfully: {engine_path}")
+        
+        # Explicitly clean up builder and network to free RAM
+        del self.network
+        del self.config
+        del self.builder
+        gc.collect()
+        torch.cuda.empty_cache()
+
         return engine_path
 
 

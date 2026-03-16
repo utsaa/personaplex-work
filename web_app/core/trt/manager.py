@@ -1,6 +1,7 @@
 import os
 import torch
 import hashlib
+import gc
 from .builder import TRTEngineBuilder, build_unet_engine, build_pose_encoder_engine
 from .runtime import TRTModel
 
@@ -87,12 +88,21 @@ class TRTEngineManager:
                     [sys.executable, "-m", "onnxsim", onnx_path, sim_onnx_path],
                     check=True
                 )
+                gc.collect()
+                torch.cuda.empty_cache()
             
             build_unet_engine(sim_onnx_path, engine_path, batch_size=2, clip_frames=clip_frames, height=height, width=width, fp8=fp8)
+            
+            # Free memory after large build
+            gc.collect()
+            torch.cuda.empty_cache()
             
         elif model_name.startswith("vae"):
             from .export_vae import export_vae_to_onnx
             export_vae_to_onnx(pt_path, onnx_dir, height=height, width=width) # Exports both encoder and decoder
+            gc.collect()
+            torch.cuda.empty_cache()
+
             encoder_onnx = os.path.join(onnx_dir, f"vae_encoder_{width}x{height}.onnx")
             decoder_onnx = os.path.join(onnx_dir, f"vae_decoder_{width}x{height}.onnx")
             encoder_engine = os.path.join(self.gpu_cache, f"vae_encoder_{width}x{height}.engine")
@@ -115,6 +125,8 @@ class TRTEngineManager:
             onnx_path = os.path.join(onnx_dir, f"{model_name}_{width}x{height}.onnx")
             base_model_path = extra_args.get("base_model_path")
             export_ref_unet_to_onnx(pt_path, onnx_path, self.echomimic_dir, base_model_path=base_model_path, height=height, width=width)
+            gc.collect()
+            torch.cuda.empty_cache()
             
             h_lat, w_lat = height // 8, width // 8
             
@@ -131,6 +143,8 @@ class TRTEngineManager:
             onnx_path = os.path.join(onnx_dir, f"{model_name}_f{clip_frames}_{width}x{height}.onnx")
             if not os.path.exists(onnx_path):
                 export_pose_encoder_to_onnx(pt_path, onnx_path, self.echomimic_dir, height=height, width=width, clip_frames=clip_frames)
+                gc.collect()
+                torch.cuda.empty_cache()
             
             # Use standardized builder with dynamic batch support
             build_pose_encoder_engine(onnx_path, engine_path, batch_size=2, clip_frames=clip_frames, height=height, width=width)
