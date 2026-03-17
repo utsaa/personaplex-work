@@ -16,16 +16,16 @@ from src.models.unet_3d_emo import EMOUNet3DConditionModel
 from core.trt.export_unet import patch_transformer_for_trt
 
 def verify_metadata(onnx_path):
-    print("\n--- Step 1: Metadata Verification ---")
+    print("\n--- Step 1: Metadata Verification ---", flush=True)
     try:
         # For models > 2GB, we should pass the path to check_model to avoid serialization errors
         onnx.checker.check_model(onnx_path)
-        print("✅ Model structure is internally consistent (validated via path).")
+        print("✅ Model structure is internally consistent (validated via path).", flush=True)
         
         # Load metadata only (without tensors) to print info if possible, or just load with external data
         model = onnx.load(onnx_path, load_external_data=False) 
-        print(f"✅ IR Version: {model.ir_version}")
-        print(f"✅ Opset Version: {model.opset_import[0].version}")
+        print(f"✅ IR Version: {model.ir_version}", flush=True)
+        print(f"✅ Opset Version: {model.opset_import[0].version}", flush=True)
         
         # Check specific input shapes
         for input_node in model.graph.input:
@@ -38,19 +38,19 @@ def verify_metadata(onnx_path):
                     else:
                         shape.append(dim.dim_param if dim.dim_param else "unk")
                 
-                print(f"✅ Input 'audio_cond_fea' shape: {shape}")
+                print(f"✅ Input 'audio_cond_fea' shape: {shape}", flush=True)
                 # check if 3rd dim is 130
                 if len(shape) >= 3 and (shape[2] == 130 or shape[2] == 'seq_len'):
-                    print("✅ Sequence length correctly identified (130/dynamic).")
+                    print("✅ Sequence length correctly identified (130/dynamic).", flush=True)
                 else:
-                    print(f"❌ Sequence length mismatch: {shape[2] if len(shape) >= 3 else 'N/A'}")
+                    print(f"❌ Sequence length mismatch: {shape[2] if len(shape) >= 3 else 'N/A'}", flush=True)
         return True
     except Exception as e:
-        print(f"❌ Metadata Check Failed: {e}")
+        print(f"❌ Metadata Check Failed: {e}", flush=True)
         return False
 
 def verify_trtexec(onnx_path):
-    print("\n--- Step 2: TensorRT Compatibility (trtexec) ---")
+    print("\n--- Step 2: TensorRT Compatibility (trtexec) ---", flush=True)
     
     # Try multiple locations for trtexec
     possible_paths = [
@@ -77,7 +77,7 @@ def verify_trtexec(onnx_path):
             pass
 
     if not trtexec_path:
-        print("⚠️ trtexec not found. Skipping compatibility test.")
+        print("⚠️ trtexec not found. Skipping compatibility test.", flush=True)
         return True
 
     cmd = [
@@ -85,36 +85,54 @@ def verify_trtexec(onnx_path):
         f"--onnx={onnx_path}",
         "--shapes=sample:2x4x13x64x64,timestep:2,audio_cond_fea:2x13x130x384,face_musk_fea:2x320x13x64x64",
         "--fp16",
-        "--dryRun"
+        "--skipInference",
+        "--verbose"
     ]
     
-    print(f"Running: {' '.join(cmd)}")
+    print(f"Running: {' '.join(cmd)}", flush=True)
+    log_file_path = "trtexec_output.log"
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-        if result.returncode == 0:
-            print("✅ TensorRT parser success (dryRun).")
+        with open(log_file_path, "w") as log_file:
+            process = subprocess.Popen(
+                cmd, 
+                stdout=subprocess.PIPE, 
+                stderr=subprocess.STDOUT, 
+                text=True,
+                bufsize=1,
+                universal_newlines=True
+            )
+            
+            for line in process.stdout:
+                print(line, end="", flush=True)
+                log_file.write(line)
+                log_file.flush()
+            
+            process.wait(timeout=300)
+        
+        if process.returncode == 0:
+            print(f"\n✅ TensorRT parser success. Logs saved to {log_file_path}", flush=True)
             return True
         else:
-            print(f"❌ TensorRT parser failed.")
-            print(result.stdout[-1000:])
-            print(result.stderr)
+            print(f"\n❌ TensorRT parser failed with return code {process.returncode}. Logs saved to {log_file_path}", flush=True)
             return False
     except subprocess.TimeoutExpired:
-        print("❌ trtexec timed out.")
+        if 'process' in locals():
+            process.kill()
+        print(f"\n❌ trtexec timed out. Partial logs saved to {log_file_path}", flush=True)
         return False
     except Exception as e:
-        print(f"❌ trtexec error: {e}")
+        print(f"❌ trtexec error: {e}", flush=True)
         return False
 
 def verify_accuracy(onnx_path, pt_path, base_model_path):
-    print("\n--- Step 3: Inference Accuracy Comparison ---")
+    print("\n--- Step 3: Inference Accuracy Comparison ---", flush=True)
     
     # Load Config
     config_path = os.path.join(ECHOMIMIC_DIR, "configs", "inference", "inference_v2.yaml")
     infer_config = OmegaConf.load(config_path)
 
     # 1. Load PyTorch Model
-    print("Loading PyTorch model...")
+    print("Loading PyTorch model...", flush=True)
     model = EMOUNet3DConditionModel.from_pretrained_2d(
         base_model_path,
         "",
@@ -129,7 +147,7 @@ def verify_accuracy(onnx_path, pt_path, base_model_path):
     model.eval()
 
     # 2. Load ONNX Model
-    print("Loading ONNX model into ONNX Runtime (CUDA)...")
+    print("Loading ONNX model into ONNX Runtime (CUDA)...", flush=True)
     sess_options = ort.SessionOptions()
     session = ort.InferenceSession(onnx_path, sess_options, providers=['CUDAExecutionProvider'])
 
@@ -141,7 +159,7 @@ def verify_accuracy(onnx_path, pt_path, base_model_path):
     face_musk_fea = torch.randn(B, 320, F, H, W, dtype=torch.float16, device="cuda")
 
     # 4. PyTorch Inference
-    print("Running PyTorch inference...")
+    print("Running PyTorch inference...", flush=True)
     with torch.no_grad():
         pt_output = model(
             sample,
@@ -153,7 +171,7 @@ def verify_accuracy(onnx_path, pt_path, base_model_path):
         )[0]
 
     # 5. ONNX Inference
-    print("Running ONNX inference...")
+    print("Running ONNX inference...", flush=True)
     onnx_inputs = {
         "sample": sample.cpu().numpy(),
         "timestep": timestep.cpu().numpy(),
@@ -168,13 +186,13 @@ def verify_accuracy(onnx_path, pt_path, base_model_path):
     max_diff = abs_diff.max().item()
     mean_diff = abs_diff.mean().item()
 
-    print(f"Max Absolute Difference: {max_diff:.6f}")
-    print(f"Mean Absolute Difference: {mean_diff:.6f}")
+    print(f"Max Absolute Difference: {max_diff:.6f}", flush=True)
+    print(f"Mean Absolute Difference: {mean_diff:.6f}", flush=True)
 
     if max_diff < 1e-2:
-        print("✅ Accuracy Check Passed (Max Diff < 0.01)")
+        print("✅ Accuracy Check Passed (Max Diff < 0.01)", flush=True)
     else:
-        print("❌ Accuracy Check Failed (Max Diff >= 0.01)")
+        print("❌ Accuracy Check Failed (Max Diff >= 0.01)", flush=True)
 
 if __name__ == "__main__":
     onnx_file = "/workspace/personaplex-work/echomimic_v2/engines/nvidia_geforce_rtx_4090/denoising_unet_acc_f12_512x512.onnx"
@@ -182,7 +200,7 @@ if __name__ == "__main__":
     base_model = "/workspace/personaplex-work/echomimic_v2/pretrained_weights/sd-image-variations-diffusers"
 
     if not os.path.exists(onnx_file):
-        print(f"ERROR: ONNX file not found: {onnx_file}")
+        print(f"ERROR: ONNX file not found: {onnx_file}", flush=True)
         sys.exit(1)
 
     m_ok = verify_metadata(onnx_file)
