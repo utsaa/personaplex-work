@@ -85,7 +85,7 @@ def patch_transformer_for_trt(model, video_length: int = 13):
             m.forward = patched_forward.__get__(m, m.__class__)
     return model
 
-def export_unet_to_onnx(pt_path, onnx_path, echomimic_dir, base_model_path=None, quantize_fp8=False, clip_frames=12, height=512, width=512):
+def export_unet_to_onnx(pt_path, onnx_path, echomimic_dir, base_model_path=None, quantize_fp8=False, clip_frames=12, height=512, width=512, use_safetensors=False):
     ensure_paths(echomimic_dir)
 
     # Load config to get model parameters
@@ -103,6 +103,7 @@ def export_unet_to_onnx(pt_path, onnx_path, echomimic_dir, base_model_path=None,
         "",  # No motion module path — handled separately in EchoMimic
         subfolder="unet" if os.path.isdir(pt_path.split('denoising_unet')[0]) else None,
         unet_additional_kwargs=OmegaConf.to_container(infer_config.unet_additional_kwargs),
+        use_safetensors=use_safetensors,
     ).to(dtype=torch.float16, device="cpu")
 
     # Load the actual weights to CPU
@@ -170,7 +171,8 @@ def export_unet_to_onnx(pt_path, onnx_path, echomimic_dir, base_model_path=None,
     # cross_attention_dim=384 from inference_v2.yaml (matches to_k input dim).
     # transformer_3d.py rearranges (B,F,n,384) → (B*F, n, 384) before passing to blocks.
     AUDIO_DIM = 384  # cross_attention_dim
-    dummy_audio = torch.randn(B, F, 1, AUDIO_DIM, dtype=torch.float16, device="cpu")
+    # Audio (B, F, seq_len, 384). Typical seq_len is 50 (margin=2) or 130 (margin=6).
+    dummy_audio = torch.randn(B, F, 130, AUDIO_DIM, dtype=torch.float16, device="cpu")
 
 
     print(f"[TRT] Clean VRAM before export: {torch.cuda.memory_allocated()/1024**2:.2f}MB allocated")
@@ -194,7 +196,7 @@ def export_unet_to_onnx(pt_path, onnx_path, echomimic_dir, base_model_path=None,
             dynamic_axes={
                 'sample': {0: 'batch', 2: 'frames'},
                 'timestep': {0: 'batch'},
-                'audio_cond_fea': {0: 'batch', 1: 'frames'},
+                'audio_cond_fea': {0: 'batch', 1: 'frames', 2: 'seq_len'},
                 'face_musk_fea': {0: 'batch', 2: 'frames'},
                 'out_sample': {0: 'batch', 2: 'frames'}
             }
@@ -217,5 +219,7 @@ if __name__ == "__main__":
     parser.add_argument("--clip-frames", type=int, default=12)
     parser.add_argument("--height", type=int, default=512)
     parser.add_argument("--width", type=int, default=512)
+    parser.add_argument("--base-model-path", type=str, default=None)
+    parser.add_argument("--use-safetensors", action="store_true", help="Use safetensors for loading")
     args = parser.parse_args()
-    export_unet_to_onnx(args.pt_path, args.onnx_path, args.echomimic_dir, clip_frames=args.clip_frames, height=args.height, width=args.width)
+    export_unet_to_onnx(args.pt_path, args.onnx_path, args.echomimic_dir, base_model_path=args.base_model_path, clip_frames=args.clip_frames, height=args.height, width=args.width, use_safetensors=args.use_safetensors)

@@ -118,7 +118,7 @@ def build_unet_engine(onnx_path, engine_path, batch_size=2, clip_frames=12, heig
     dynamic_shapes = {
         "sample":         [(batch_size, 4, F_val, h_lat, w_lat), (batch_size, 4, F_val, h_lat, w_lat), (batch_size, 4, F_val, h_lat, w_lat)],
         "timestep":       [(batch_size,), (batch_size,), (batch_size,)],
-        "audio_cond_fea": [(batch_size, F_val, 1, 384), (batch_size, F_val, 1, 384), (batch_size, F_val, 1, 384)],
+        "audio_cond_fea": [(batch_size, F_val, 1, 384), (batch_size, F_val, 130, 384), (batch_size, F_val, 256, 384)],
         "face_musk_fea":  [(batch_size, 320, F_val, h_lat, w_lat), (batch_size, 320, F_val, h_lat, w_lat), (batch_size, 320, F_val, h_lat, w_lat)],
     }
 

@@ -582,6 +582,7 @@ class UNet3DConditionModel(ModelMixin, ConfigMixin):
         subfolder=None,
         unet_additional_kwargs=None,
         mm_zero_proj_out=False,
+        use_safetensors=None,
     ):
         pretrained_model_path = Path(pretrained_model_path)
         motion_module_path = Path(motion_module_path)
@@ -613,14 +614,18 @@ class UNet3DConditionModel(ModelMixin, ConfigMixin):
 
         model = cls.from_config(unet_config, **unet_additional_kwargs)
         # load the vanilla weights
-        if pretrained_model_path.joinpath(SAFETENSORS_WEIGHTS_NAME).exists():
+        state_dict = None
+        
+        # Priority: use_safetensors flag, then existence
+        load_safetensors = use_safetensors if use_safetensors is not None else pretrained_model_path.joinpath(SAFETENSORS_WEIGHTS_NAME).exists()
+        
+        if load_safetensors and pretrained_model_path.joinpath(SAFETENSORS_WEIGHTS_NAME).exists():
             logger.debug(
                 f"loading safeTensors weights from {pretrained_model_path} ..."
             )
             state_dict = load_file(
                 pretrained_model_path.joinpath(SAFETENSORS_WEIGHTS_NAME), device="cpu"
             )
-
         elif pretrained_model_path.joinpath(WEIGHTS_NAME).exists():
             logger.debug(f"loading weights from {pretrained_model_path} ...")
             state_dict = torch.load(
@@ -628,8 +633,9 @@ class UNet3DConditionModel(ModelMixin, ConfigMixin):
                 map_location="cpu",
                 weights_only=True,
             )
-        else:
-            raise FileNotFoundError(f"no weights file found in {pretrained_model_path}")
+        
+        if state_dict is None:
+            raise FileNotFoundError(f"no weights file found in {pretrained_model_path} matching use_safetensors={use_safetensors}")
 
         # load the motion module weights
         if motion_module_path.exists() and motion_module_path.is_file():

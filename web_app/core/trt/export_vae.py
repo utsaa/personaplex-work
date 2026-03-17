@@ -22,8 +22,8 @@ class VAEDecoderWrapper(nn.Module):
     def forward(self, z):
         return self.vae.decode(z).sample
 
-def export_vae_to_onnx(model_path, onnx_dir, device="cuda", height=512, width=512):
-    vae = AutoencoderKL.from_pretrained(model_path, torch_dtype=torch.float16).to(device)
+def export_vae_to_onnx(model_path, onnx_dir, device="cuda", height=512, width=512, use_safetensors=False):
+    vae = AutoencoderKL.from_pretrained(model_path, torch_dtype=torch.float16, use_safetensors=use_safetensors).to(device)
     vae.eval()
 
     # 1. Encoder
@@ -55,6 +55,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-path", type=str, required=True)
     parser.add_argument("--onnx-dir", type=str, required=True)
+    parser.add_argument("--use-safetensors", action="store_true", help="Use safetensors for loading")
     args = parser.parse_args()
     os.makedirs(args.onnx_dir, exist_ok=True)
-    export_vae_to_onnx(args.model_path, args.onnx_dir)
+    export_vae_to_onnx(args.model_path, args.onnx_dir, use_safetensors=args.use_safetensors)

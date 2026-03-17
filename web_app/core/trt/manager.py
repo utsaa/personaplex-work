@@ -13,7 +13,7 @@ class TRTEngineManager:
         self.gpu_cache = os.path.join(self.cache_base, self.gpu_name)
         os.makedirs(self.gpu_cache, exist_ok=True)
 
-    def get_unet_engine(self, unet_pt_path, base_model_path=None, force_rebuild=False, fp8=False, clip_frames=12, video_length=25, width=512, height=512):
+    def get_unet_engine(self, unet_pt_path, base_model_path=None, force_rebuild=False, fp8=False, clip_frames=12, video_length=25, width=512, height=512, use_safetensors=False):
         """Gets the path to a compiled UNet engine.
         
         Args:
@@ -23,17 +23,17 @@ class TRTEngineManager:
         return self._get_engine("denoising_unet_acc", unet_pt_path, force_rebuild,
                                extra_args={"base_model_path": base_model_path, "fp8": fp8,
                                            "clip_frames": clip_frames, "video_length": video_length,
-                                           "width": width, "height": height})
+                                           "width": width, "height": height, "use_safetensors": use_safetensors})
 
-    def get_vae_encoder_engine(self, vae_path, force_rebuild=False, width=512, height=512):
-        return self._get_engine("vae_encoder", vae_path, force_rebuild, extra_args={"width": width, "height": height})
+    def get_vae_encoder_engine(self, vae_path, force_rebuild=False, width=512, height=512, use_safetensors=False):
+        return self._get_engine("vae_encoder", vae_path, force_rebuild, extra_args={"width": width, "height": height, "use_safetensors": use_safetensors})
 
-    def get_vae_decoder_engine(self, vae_path, force_rebuild=False, width=512, height=512):
-        return self._get_engine("vae_decoder", vae_path, force_rebuild, extra_args={"width": width, "height": height})
+    def get_vae_decoder_engine(self, vae_path, force_rebuild=False, width=512, height=512, use_safetensors=False):
+        return self._get_engine("vae_decoder", vae_path, force_rebuild, extra_args={"width": width, "height": height, "use_safetensors": use_safetensors})
 
-    def get_ref_unet_engine(self, ref_unet_pt_path, base_model_path=None, force_rebuild=False, width=512, height=512):
+    def get_ref_unet_engine(self, ref_unet_pt_path, base_model_path=None, force_rebuild=False, width=512, height=512, use_safetensors=False):
         return self._get_engine("reference_unet", ref_unet_pt_path, force_rebuild,
-                               extra_args={"base_model_path": base_model_path, "width": width, "height": height})
+                               extra_args={"base_model_path": base_model_path, "width": width, "height": height, "use_safetensors": use_safetensors})
 
     def get_pose_encoder_engine(self, pose_pt_path, force_rebuild=False, width=512, height=512, clip_frames=12):
         return self._get_engine("pose_encoder", pose_pt_path, force_rebuild, extra_args={"width": width, "height": height, "clip_frames": clip_frames})
@@ -69,29 +69,52 @@ class TRTEngineManager:
         if model_name == "denoising_unet_acc":
             from .export_unet import export_unet_to_onnx
             onnx_path = os.path.join(onnx_dir, f"{engine_name}.onnx")
-            sim_onnx_path = os.path.join(onnx_dir, f"{engine_name}_sim.onnx")
             base_model_path = extra_args.get("base_model_path")
             clip_frames = extra_args.get("clip_frames", 12)
             height = extra_args.get("height", 512)
-            width = extra_args.get("width", 512)
+            use_safetensors = extra_args.get("use_safetensors", False)
             
             # Export if the un-simplified onnx doesn't exist (we will simplify it externally or below)
-            if not os.path.exists(sim_onnx_path):
-                if not os.path.exists(onnx_path):
-                    export_unet_to_onnx(pt_path, onnx_path, self.echomimic_dir, base_model_path=base_model_path, quantize_fp8=fp8, clip_frames=clip_frames, height=height, width=width)
+            onnx_path = os.path.join(onnx_dir, f"denoising_unet_acc_f{clip_frames}_{width}x{height}.onnx")
+            sim_onnx_path = os.path.join(onnx_dir, f"denoising_unet_acc_f{clip_frames}_{width}x{height}_sim.onnx")
+            
+            # Determine the best available ONNX file
+            final_onnx = sim_onnx_path if os.path.exists(sim_onnx_path) else onnx_path
+
+            if not os.path.exists(final_onnx):
+                # Neither simplified nor raw ONNX exists -> Full export flow
+                print(f"[TRT] ONNX files missing. Starting export flow...")
+                export_unet_to_onnx(pt_path, onnx_path, self.echomimic_dir, base_model_path=base_model_path, quantize_fp8=fp8, clip_frames=clip_frames, height=height, width=width, use_safetensors=use_safetensors)
                 
-                # Simplify the ONNX graph before building TRT engine
-                print(f"[ONNX] Simplifying {onnx_path} to {sim_onnx_path}...")
-                import subprocess
-                import sys
-                subprocess.run(
-                    [sys.executable, "-m", "onnxsim", onnx_path, sim_onnx_path],
-                    check=True
-                )
+                # Consolidate external data into a single .data file (cleaner than hundreds of .weight files)
+                import onnx
+                print(f"[ONNX] Consolidating external data for {onnx_path}...")
+                model = onnx.load(onnx_path, load_external_data=True)
+                onnx.save(model, onnx_path, save_as_external_data=True, all_tensors_to_one_file=True, location=os.path.basename(onnx_path) + ".data")
+                del model
+                gc.collect()
+
+                # Try to simplify, but fallback if it fails (common for >2GB models due to protobuf limits)
+                print(f"[ONNX] Attempting to simplify {onnx_path} to {sim_onnx_path}...")
+                try:
+                    import subprocess
+                    import sys
+                    subprocess.run(
+                        [sys.executable, "-m", "onnxsim", onnx_path, sim_onnx_path, "--no-large-tensor"],
+                        check=True
+                    )
+                    print(f"[ONNX] Simplification successful.")
+                    final_onnx = sim_onnx_path
+                except Exception as e:
+                    print(f"[ONNX] Simplification failed (likely due to model size): {e}")
+                    print(f"[ONNX] Falling back to non-simplified ONNX.")
+                    final_onnx = onnx_path
+
                 gc.collect()
                 torch.cuda.empty_cache()
             
-            build_unet_engine(sim_onnx_path, engine_path, batch_size=2, clip_frames=clip_frames, height=height, width=width, fp8=fp8)
+            print(f"[TRT] Building engine from {final_onnx}...")
+            build_unet_engine(final_onnx, engine_path, batch_size=2, clip_frames=clip_frames, height=height, width=width, fp8=fp8)
             
             # Free memory after large build
             gc.collect()
@@ -99,7 +122,8 @@ class TRTEngineManager:
             
         elif model_name.startswith("vae"):
             from .export_vae import export_vae_to_onnx
-            export_vae_to_onnx(pt_path, onnx_dir, height=height, width=width) # Exports both encoder and decoder
+            use_safetensors = extra_args.get("use_safetensors", False)
+            export_vae_to_onnx(pt_path, onnx_dir, height=height, width=width, use_safetensors=use_safetensors) # Exports both encoder and decoder
             gc.collect()
             torch.cuda.empty_cache()
 
@@ -124,7 +148,8 @@ class TRTEngineManager:
             from .export_ref_unet import export_ref_unet_to_onnx
             onnx_path = os.path.join(onnx_dir, f"{model_name}_{width}x{height}.onnx")
             base_model_path = extra_args.get("base_model_path")
-            export_ref_unet_to_onnx(pt_path, onnx_path, self.echomimic_dir, base_model_path=base_model_path, height=height, width=width)
+            use_safetensors = extra_args.get("use_safetensors", False)
+            export_ref_unet_to_onnx(pt_path, onnx_path, self.echomimic_dir, base_model_path=base_model_path, height=height, width=width, use_safetensors=use_safetensors)
             gc.collect()
             torch.cuda.empty_cache()
             

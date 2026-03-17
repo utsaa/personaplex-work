@@ -7,7 +7,7 @@ def ensure_paths(echomimic_dir):
     if echomimic_dir not in sys.path:
         sys.path.insert(0, echomimic_dir)
 
-def export_ref_unet_to_onnx(model_path, onnx_path, echomimic_dir, base_model_path=None, device="cuda", height=512, width=512):
+def export_ref_unet_to_onnx(model_path, onnx_path, echomimic_dir, base_model_path=None, device="cuda", height=512, width=512, use_safetensors=False):
     ensure_paths(echomimic_dir)
     from src.models.unet_2d_condition import UNet2DConditionModel
     # Reference UNet is 2D
@@ -21,7 +21,7 @@ def export_ref_unet_to_onnx(model_path, onnx_path, echomimic_dir, base_model_pat
         if not os.path.isdir(base_path):
              base_path = "./pretrained_weights/sd-image-variations-diffusers"
 
-    unet = UNet2DConditionModel.from_pretrained(base_path, subfolder="unet", torch_dtype=torch.float16).to(device)
+    unet = UNet2DConditionModel.from_pretrained(base_path, subfolder="unet", torch_dtype=torch.float16, use_safetensors=use_safetensors).to(device)
     
     # Load weights
     print(f"[TRT] Loading weights {model_path} to {device}...")
@@ -72,5 +72,6 @@ if __name__ == "__main__":
     parser.add_argument("--base-model-path", type=str, default=None)
     parser.add_argument("--height", type=int, default=512)
     parser.add_argument("--width", type=int, default=512)
+    parser.add_argument("--use-safetensors", action="store_true", help="Use safetensors for loading")
     args = parser.parse_args()
-    export_ref_unet_to_onnx(args.pt_path, args.onnx_path, args.echomimic_dir, base_model_path=args.base_model_path, height=args.height, width=args.width)
+    export_ref_unet_to_onnx(args.pt_path, args.onnx_path, args.echomimic_dir, base_model_path=args.base_model_path, height=args.height, width=args.width, use_safetensors=args.use_safetensors)
