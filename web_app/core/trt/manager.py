@@ -79,7 +79,11 @@ class TRTEngineManager:
             sim_onnx_path = os.path.join(onnx_dir, f"denoising_unet_acc_f{clip_frames}_{width}x{height}_sim.onnx")
             
             # Determine the best available ONNX file
-            final_onnx = sim_onnx_path if os.path.exists(sim_onnx_path) else onnx_path
+            skip_simplify = os.environ.get("TRT_SKIP_SIMPLIFY", "false").lower() == "true"
+            if skip_simplify:
+                final_onnx = onnx_path
+            else:
+                final_onnx = sim_onnx_path if os.path.exists(sim_onnx_path) else onnx_path
 
             if not os.path.exists(final_onnx):
                 # Neither simplified nor raw ONNX exists -> Full export flow
@@ -94,21 +98,25 @@ class TRTEngineManager:
                 del model
                 gc.collect()
 
-                # Try to simplify, but fallback if it fails (common for >2GB models due to protobuf limits)
-                print(f"[ONNX] Attempting to simplify {onnx_path} to {sim_onnx_path}...")
-                try:
-                    import subprocess
-                    import sys
-                    subprocess.run(
-                        [sys.executable, "-m", "onnxsim", onnx_path, sim_onnx_path, "--no-large-tensor"],
-                        check=True
-                    )
-                    print(f"[ONNX] Simplification successful.")
-                    final_onnx = sim_onnx_path
-                except Exception as e:
-                    print(f"[ONNX] Simplification failed (likely due to model size): {e}")
-                    print(f"[ONNX] Falling back to non-simplified ONNX.")
+                if skip_simplify:
+                    print(f"[ONNX] Skipping simplification as TRT_SKIP_SIMPLIFY is set.")
                     final_onnx = onnx_path
+                else:
+                    # Try to simplify, but fallback if it fails (common for >2GB models due to protobuf limits)
+                    print(f"[ONNX] Attempting to simplify {onnx_path} to {sim_onnx_path}...")
+                    try:
+                        import subprocess
+                        import sys
+                        subprocess.run(
+                            [sys.executable, "-m", "onnxsim", onnx_path, sim_onnx_path, "--no-large-tensor"],
+                            check=True
+                        )
+                        print(f"[ONNX] Simplification successful.")
+                        final_onnx = sim_onnx_path
+                    except Exception as e:
+                        print(f"[ONNX] Simplification failed (likely due to model size): {e}")
+                        print(f"[ONNX] Falling back to non-simplified ONNX.")
+                        final_onnx = onnx_path
 
                 gc.collect()
                 torch.cuda.empty_cache()
