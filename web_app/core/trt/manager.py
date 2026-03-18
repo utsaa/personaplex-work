@@ -1,9 +1,13 @@
 import os
+from dotenv import load_dotenv
 import torch
 import hashlib
 import gc
 from .builder import TRTEngineBuilder, build_unet_engine, build_pose_encoder_engine
 from .runtime import TRTModel
+
+load_dotenv()
+
 
 class TRTEngineManager:
     def __init__(self, echomimic_dir, cache_dir="engines"):
