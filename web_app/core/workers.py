@@ -213,16 +213,22 @@ def input_preparation_thread(
                 # This prevents "jittery" flushes during small network/processing gaps.
                 idle_timeout = float(os.getenv("IDLE_FLUSH_TIMEOUT", 1.5))
                 if (time.time() - idle_since) > idle_timeout:
-                    print(f"[PREP] Idle timeout ({idle_timeout}s) reached. Flushing silent clip to reset avatar.")
-                    audio_history_buffer, pose_idx = _perform_idle_flush(
-                        audio_history_buffer, history_samples, sample_rate, fps,
-                        pose_provider, pose_idx, prepared_queue, overlap_frames
-                    )
-                    # Push explicit flush token AFTER the silent clip
-                    prepared_queue.put(FLUSH_SENTINEL)
-                    
-                    has_flushed = True
-                    should_reset_after_flush = True
+                    if len(incoming_audio_buffer) > 0:
+                        pad_samples = samples_per_clip - len(incoming_audio_buffer)
+                        print(f"[PREP] Idle timeout ({idle_timeout}s) reached. Padding {len(incoming_audio_buffer)/sample_rate:.2f}s of pending audio with silence to complete clip.")
+                        silence_pad = np.zeros(pad_samples, dtype=np.float32)
+                        incoming_audio_buffer = np.concatenate((incoming_audio_buffer, silence_pad))
+                    else:
+                        print(f"[PREP] Idle timeout ({idle_timeout}s) reached. Flushing silent clip to reset avatar.")
+                        audio_history_buffer, pose_idx = _perform_idle_flush(
+                            audio_history_buffer, history_samples, sample_rate, fps,
+                            pose_provider, pose_idx, prepared_queue, overlap_frames
+                        )
+                        # Push explicit flush token AFTER the silent clip
+                        prepared_queue.put(FLUSH_SENTINEL)
+                        
+                        has_flushed = True
+                        should_reset_after_flush = True
                     idle_since = None 
             else:
                 # If queue is not empty, reset the idle timer
@@ -463,14 +469,22 @@ def _run_single_gpu_loop(
                 final_audio = audio_data
                 final_ctx = ctx_frames
 
+            # Calculate context logic
+
             # Retrieve previous latent if available and enabled
             latent_to_use = gpu_manager.last_latents[0] if use_init_latent else None
             if latent_to_use is not None:
                 print(f"[GEN] GPU 0: Using previous latent for continuity.")
 
+            # The pipeline internally extracts whisper features, so we MUST pass raw audio.
             video_np, final_latent = generate_video_clip(
-                pipe, ref_image, final_audio, poses_tensor,
-                W, H, gen_frames, sample_rate, fps, steps, cfg,
+                pipe,
+                ref_image,
+                final_audio,
+                poses_tensor,
+                W=W, H=H,
+                clip_frames=gen_frames, sample_rate=sample_rate, fps=fps,
+                steps=steps, cfg=cfg,
                 init_latent=latent_to_use,
                 use_init_latent=use_init_latent,
                 audio_margin=audio_margin,
@@ -927,7 +941,7 @@ def warmup_pipeline(gpu_manager: MultiGPUManager, ref_image, pose_provider, args
                         width, height, video_length, steps, cfg,
                         generator=generator,
                         audio_sample_rate=sample_rate,
-                        context_frames=12, fps=fps,
+                        context_frames=video_length, fps=fps,
                         context_overlap=3, start_idx=0,
                         audio_margin=args.audio_margin,
                         init_latents=init_latent,

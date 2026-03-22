@@ -152,7 +152,7 @@ class TRTEngineManager:
                 "input": [(1, 3, height, width), (1, 3, height, width), (2, 3, height, width)]
             })
             TRTEngineBuilder().build_engine(decoder_onnx, decoder_engine, dynamic_shapes={
-                "latent": [(1, 4, h_lat, w_lat), (1, 4, h_lat, w_lat), (25, 4, h_lat, w_lat)]
+                "latent": [(1, 4, h_lat, w_lat), (1, 4, h_lat, w_lat), (32, 4, h_lat, w_lat)]
             })
             return encoder_engine if "encoder" in model_name else decoder_engine
 
@@ -169,9 +169,9 @@ class TRTEngineManager:
             
             builder = TRTEngineBuilder()
             builder.build_engine(onnx_path, engine_path, dynamic_shapes={
-                "sample": [(1, 4, h_lat, w_lat), (1, 4, h_lat, w_lat), (1, 4, h_lat, w_lat)],
-                "timestep": [(1,), (1,), (1,)],
-                "encoder_hidden_states": [(1, 1, 768), (1, 1, 768), (1, 1, 768)]
+                "sample": [(1, 4, h_lat, w_lat), (1, 4, h_lat, w_lat), (2, 4, h_lat, w_lat)],
+                "timestep": [(1,), (1,), (2,)],
+                "encoder_hidden_states": [(1, 1, 768), (1, 1, 768), (2, 1, 768)]
             })
 
         elif model_name == "pose_encoder":

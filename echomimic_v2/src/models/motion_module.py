@@ -264,6 +264,8 @@ class PositionalEncoding(nn.Module):
     def __init__(self, d_model, dropout=0.0, max_len=24):
         super().__init__()
         self.dropout = nn.Dropout(p=dropout)
+        # Ensure max_len is large enough to handle any --clip-frames requested by the user
+        max_len = max(max_len, 2048)
         position = torch.arange(max_len).unsqueeze(1)
         div_term = torch.exp(
             torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model)

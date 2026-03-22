@@ -114,6 +114,38 @@
     let playbackStarted = false;
     let flushReceived = false;    // New: robust bypass flag
 
+    let playbackStartAudioTime = 0;
+    let framesPlayed = 0;
+
+    function playLoop() {
+      if (!playbackStarted) return;
+      
+      const elapsed = playCtx.currentTime - playbackStartAudioTime;
+      const targetFrame = Math.floor(elapsed * TARGET_FPS);
+
+      while (framesPlayed < targetFrame) {
+        if (frameBuffer.length === 0) {
+          // Buffer underrun — pause audio and video and wait for re-buffer
+          console.log("[PLAY] Buffer empty. Suspending audio and video.");
+          playCtx.suspend();
+          stopPlayback();
+          playbackStarted = false;
+          setStatus('Buffering (empty)...');
+          return;
+        }
+        
+        const url = frameBuffer.shift();
+        const img = document.getElementById('video');
+        const old = img.src;
+        img.src = url;
+        if (old && old.startsWith('blob:')) URL.revokeObjectURL(old);
+        framesPlayed++;
+      }
+      
+      updateBufferGauge();
+      playbackTimer = requestAnimationFrame(playLoop);
+    }
+
     function startPlayback() {
       if (playbackTimer) return;
 
@@ -128,40 +160,30 @@
       if (playCtx.state === 'suspended') {
         console.log("[PLAY] Resuming suspended AudioContext...");
         playCtx.resume();
+      } else {
+        // First time starting or resuming after full stop
+        playNextTime = playCtx.currentTime;
       }
 
       playbackStarted = true;
       setStatus('Playing');
 
       // 1. Drain any buffered audio immediately
-      playNextTime = playCtx.currentTime;
       while (audioQueue.length > 0) {
         const payload = audioQueue.shift();
         scheduleAudio(payload);
       }
 
-      // 2. Start video interval
-      const interval = 1000 / TARGET_FPS;
-      playbackTimer = setInterval(() => {
-        if (frameBuffer.length === 0) {
-          // Buffer underrun — pause and wait for re-buffer
-          console.log("[PLAY] Buffer empty. Stopping playback.");
-          stopPlayback();
-          playbackStarted = false;
-          setStatus('Buffering (empty)...');
-          return;
-        }
-        const url = frameBuffer.shift();
-        const img = document.getElementById('video');
-        const old = img.src;
-        img.src = url;
-        if (old && old.startsWith('blob:')) URL.revokeObjectURL(old);
-        updateBufferGauge();
-      }, interval);
+      // 2. Start video loop tied to audio time
+      playbackStartAudioTime = playCtx.currentTime - (framesPlayed / TARGET_FPS);
+      playbackTimer = requestAnimationFrame(playLoop);
     }
 
     function stopPlayback() {
-      if (playbackTimer) { clearInterval(playbackTimer); playbackTimer = null; }
+      if (playbackTimer) { 
+        cancelAnimationFrame(playbackTimer); 
+        playbackTimer = null; 
+      }
     }
 
     function scheduleAudio(payload) {
@@ -216,17 +238,24 @@
           processor.onaudioprocess = (e) => {
             if (ws && ws.readyState === WebSocket.OPEN && !micMuted) {
               const pcm = e.inputBuffer.getChannelData(0);
-              const rms = computeRMS(pcm);
+              
+              // Amplify audio to increase lip movement (gain = 2.5)
+              const amplified = new Float32Array(pcm.length);
+              for (let i = 0; i < pcm.length; i++) {
+                amplified[i] = pcm[i] * 2.5; 
+              }
+
+              const rms = computeRMS(amplified);
               const indicator = document.getElementById('vad-indicator');
 
               if (rms >= VAD_RMS_THRESHOLD) {
                 vadHoldCounter = VAD_HOLD_CHUNKS;
                 flushReceived = false; // Reset flush state when user starts talking
-                ws.send(new Float32Array(pcm).buffer);
+                ws.send(amplified.buffer);
                 if (indicator) { indicator.textContent = 'VAD: speaking \u{1F50A}'; indicator.style.color = '#0f0'; }
               } else if (vadHoldCounter > 0) {
                 vadHoldCounter--;
-                ws.send(new Float32Array(pcm).buffer);
+                ws.send(amplified.buffer);
                 if (indicator) { indicator.textContent = 'VAD: tail...'; indicator.style.color = '#aa0'; }
               } else {
                 if (indicator) { indicator.textContent = 'VAD: silent'; indicator.style.color = '#555'; }

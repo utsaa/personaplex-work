@@ -34,7 +34,12 @@ class TRTModel:
         """Set dynamic input shapes for the execution context."""
         for name, tensor in inputs.items():
             if name in self.input_names:
-                self.context.set_input_shape(name, tensor.shape)
+                if not self.context.set_input_shape(name, tensor.shape):
+                    # Usually means the shape is out of bounds (min/opt/max) defined during build
+                    profile_index = self.context.active_optimization_profile
+                    min_shape, opt_shape, max_shape = self.engine.get_tensor_profile_shape(name, profile_index)
+                    raise ValueError(f"[TRT] Failed to set input shape for '{name}' to {tensor.shape}. "
+                                     f"Engine range: {min_shape} .. {max_shape}")
 
     def run(self, inputs):
         """

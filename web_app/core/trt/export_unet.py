@@ -109,6 +109,23 @@ def export_unet_to_onnx(pt_path, onnx_path, echomimic_dir, base_model_path=None,
     # Load the actual weights to CPU
     print(f"[TRT] Loading weights {pt_path} to CPU...")
     state_dict = torch.load(pt_path, map_location="cpu")
+    
+    # [FIX] Check if motion module weights are present. If not, load them from a separate file.
+    mm_keys = [k for k in state_dict.keys() if "motion_module" in k]
+    if len(mm_keys) == 0:
+        print("[TRT] Motion module weights NOT found in UNet checkpoint. Attempting to load separately...")
+        mm_path = os.path.join(os.path.dirname(pt_path), "motion_module_acc.pth")
+        if not os.path.exists(mm_path):
+            mm_path = os.path.join(os.path.dirname(pt_path), "motion_module.pth")
+            
+        if os.path.exists(mm_path):
+            print(f"[TRT] Loading motion module weights from {mm_path}...")
+            mm_state_dict = torch.load(mm_path, map_location="cpu")
+            state_dict.update(mm_state_dict)
+            del mm_state_dict
+        else:
+            print(f"[TRT] [WARNING] Motion module weights NOT found at {mm_path}. Video will likely be blurry.")
+
     model.load_state_dict(state_dict, strict=False)
     del state_dict  # Free CPU RAM ASAP
     torch.cuda.empty_cache()
