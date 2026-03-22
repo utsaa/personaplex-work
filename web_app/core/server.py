@@ -128,23 +128,14 @@ async def run_server(
                     while True:
                         try:
                             frame_data = frame_queue.get_nowait()
+                            # If we get a flush tag (b'\x03'), send it directly
                             await ws.send_bytes(frame_data)
+                            if frame_data == b'\x03':
+                                print("[WEB] Sent explicit Flush Signal (Tag 03)")
                             sent_any = True
                         except queue.Empty:
                             break
-
-                    # Signal Flush (Tag 03) ONLY if all internal GPU/CPU processing queues are empty
-                    # This ensures the client only bypasses the 60s buffer when generation is TRULY finished.
-                    if (prepared_queue.empty() and 
-                        raw_clip_queue.empty() and 
-                        frame_queue.empty() and 
-                        active_clips[0] == 0):
-                        if not flush_done:
-                            print("[WEB] Sending Flush Signal (Tag 03)")
-                            await ws.send_bytes(b'\x03')
-                            flush_done = True
-                    else:
-                        flush_done = False
+                    # Removed heuristic-based flush logic; Tag 03 is now signaled explicitly via frame_queue.
 
                     if not sent_any:
                         await asyncio.sleep(frame_interval)

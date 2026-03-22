@@ -29,6 +29,9 @@ EMPTY_AUDIO_DURATION: float = 0.5
 # Worker 1: Input Preparation (CPU)
 # ---------------------------------------------------------------------------
 
+# Sentinels for cross-thread signaling
+FLUSH_SENTINEL = "__FLUSH__"
+
 def _perform_idle_flush(
     audio_history_buffer: np.ndarray,
     history_samples: int,
@@ -215,6 +218,9 @@ def input_preparation_thread(
                         audio_history_buffer, history_samples, sample_rate, fps,
                         pose_provider, pose_idx, prepared_queue, overlap_frames
                     )
+                    # Push explicit flush token AFTER the silent clip
+                    prepared_queue.put(FLUSH_SENTINEL)
+                    
                     has_flushed = True
                     should_reset_after_flush = True
                     idle_since = None 
@@ -400,6 +406,9 @@ def _run_single_gpu_loop(
             batch = prepared_queue.get_nowait()
         except queue.Empty:
             time.sleep(0.002)
+            continue
+        if batch is FLUSH_SENTINEL:
+            raw_clip_queue.put(FLUSH_SENTINEL)
             continue
 
         audio_data, poses_tensor, ctx_frames, current_audio, reset_latent = batch
@@ -607,6 +616,11 @@ def _run_multi_gpu_loop(
             except queue.Empty:
                 batch = None
 
+            if batch is FLUSH_SENTINEL:
+                _drain_pending(pending, raw_clip_queue, tail_buffer, is_first_chunk, K, clip_frames)
+                raw_clip_queue.put(FLUSH_SENTINEL)
+                continue
+
             if batch is not None:
                 audio_data, poses_tensor, ctx_frames, current_audio, reset_latent = batch
 
@@ -801,7 +815,12 @@ def postprocess_thread(
     print("[POST] Post-processing thread started.")
     while not stop_event.is_set():
         try:
-            video_np, clip_audio = raw_clip_queue.get_nowait()
+            data = raw_clip_queue.get_nowait()
+            if data is FLUSH_SENTINEL:
+                # Propagate flush signal to the frame queue
+                frame_queue.put(b'\x03')
+                continue
+            video_np, clip_audio = data
         except queue.Empty:
             time.sleep(0.002)
             continue
