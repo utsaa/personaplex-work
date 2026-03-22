@@ -262,7 +262,8 @@ class ReferenceAttentionControl:
             )
 
             for i, module in enumerate(attn_modules):
-                module._original_inner_forward = module.forward
+                if not hasattr(module, "_original_inner_forward"):
+                    module._original_inner_forward = module.forward
                 if isinstance(module, BasicTransformerBlock):
                     module.forward = hacked_basic_transformer_inner_forward.__get__(
                         module, BasicTransformerBlock

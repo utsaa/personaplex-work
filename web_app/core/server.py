@@ -31,8 +31,7 @@ async def run_server(
     )
     print(f"[INIT] Reference encoded on all GPUs.")
 
-    if args.compile_unet:
-        warmup_pipeline(gpu_manager, ref_image, pose_provider, args)
+    print(f"[INIT] Reference encoded on all GPUs.")
 
     # Queues for Parallel Workers
     input_queue = queue.Queue()          # WS -> Input Prep
@@ -45,6 +44,7 @@ async def run_server(
     active_clips = [0] 
     
     stop_event = threading.Event()
+    warmup_done_event = threading.Event()
 
     # 1. Input Preparation Thread (CPU)
     input_thread = threading.Thread(
@@ -71,7 +71,8 @@ async def run_server(
             gpu_manager, ref_image, prepared_queue, raw_clip_queue, stop_event,
             args.sample_rate, args.fps, args.clip_frames,
             args.width, args.height, args.steps, args.cfg,
-            args.use_init_latent, args.audio_margin, active_clips
+            args.use_init_latent, args.audio_margin, active_clips,
+            pose_provider, args, warmup_done_event
         ),
         daemon=True,
     )
@@ -175,6 +176,17 @@ async def run_server(
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", args.port)
+    
+    # Wait for the worker thread to finish its torch.compile warmup 
+    # before we open the port to the public.
+    if args.compile_unet:
+        print("[INIT] Waiting for background torch.compile warmup to complete...")
+        while not warmup_done_event.is_set() and not stop_event.is_set():
+            await asyncio.sleep(1.0)
+        if stop_event.is_set():
+            return
+        print("[INIT] Warmup complete. Ready for inference.")
+
     await site.start()
     print(f"[WEB] Server running at http://0.0.0.0:{args.port} (IPv4)")
     print(f"[WEB] Open http://127.0.0.1:{args.port} in your browser.\n")

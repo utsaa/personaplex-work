@@ -1,4 +1,4 @@
-
+import argparse
 import os
 import queue
 import threading
@@ -16,6 +16,9 @@ from PIL import Image
 from core.audio import _rms
 from core.gpu import MultiGPUManager, blend_overlap
 from core.pose import PoseProvider
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # Maximum time to wait for a single GPU generation result (seconds)
 GPU_RESULT_TIMEOUT_S: int = 300
@@ -34,6 +37,7 @@ def _perform_idle_flush(
     pose_provider: PoseProvider,
     pose_idx: int,
     prepared_queue: queue.Queue,
+    overlap_frames: int = 0,
 ) -> tuple[np.ndarray, int]:
     """Flushes a short silent clip to return avatar to neutral pose."""
     flush_samples = int(sample_rate * EMPTY_AUDIO_DURATION)
@@ -45,9 +49,10 @@ def _perform_idle_flush(
     ctx_frames = int((len(audio_history_buffer) / sample_rate) * fps)
     
     try:
-        # Get poses for this short silent clip
+        # Get poses for this short silent clip (+ overlap if needed)
         flush_frames = int(EMPTY_AUDIO_DURATION * fps)
-        poses_tensor = pose_provider.get_batch(pose_idx, flush_frames)
+        num_poses = flush_frames + overlap_frames
+        poses_tensor = pose_provider.get_batch(pose_idx, num_poses)
         new_pose_idx = pose_idx + flush_frames
         
         # Backlog is no longer passed here; calculated real-time in the loop
@@ -100,6 +105,7 @@ def input_preparation_thread(
     has_flushed = False
     should_reset_after_flush = False
     empty_flush_count = 0
+    idle_since = None  # Timer to prevent excessive flushing
 
     print(f"[PREP] Waiting for audio (target clip: {samples_per_clip} samples) ...")
     print(f"[PREP] Audio Context: {history_samples/sample_rate:.2f}s history + "
@@ -112,11 +118,13 @@ def input_preparation_thread(
             while True:
                 chunk = audio_queue.get_nowait()
                 incoming_audio_buffer = np.concatenate((incoming_audio_buffer, chunk))
+                idle_since = None # Data arrived, reset idle timer
         except queue.Empty:
             pass
 
         # 2. Process clips
         if len(incoming_audio_buffer) >= samples_per_clip:
+            idle_since = None # We are processing, not idle
             current_audio = incoming_audio_buffer[:samples_per_clip]
             incoming_audio_buffer = incoming_audio_buffer[samples_per_clip:]
 
@@ -170,7 +178,9 @@ def input_preparation_thread(
 
             try:
                 # Prepare Pose Tensor using Provider
-                poses_tensor = pose_provider.get_batch(pose_idx, clip_frames)
+                # Fetch overlap_frames extra if K > 0 to match GPU requirements
+                num_poses = clip_frames + overlap_frames
+                poses_tensor = pose_provider.get_batch(pose_idx, num_poses)
                 pose_idx = pose_idx + clip_frames
 
                 # Push to GPU thread
@@ -193,11 +203,25 @@ def input_preparation_thread(
         else:
             # 3. Handle empty queue / idle flush
             if audio_queue.empty() and not has_flushed and len(incoming_audio_buffer) < samples_per_clip:
-                audio_history_buffer, pose_idx = _perform_idle_flush(
-                    audio_history_buffer, history_samples, sample_rate, fps,
-                    pose_provider, pose_idx, prepared_queue
-                )
-                has_flushed = True
+                if idle_since is None:
+                    idle_since = time.time()
+                
+                # Only flush if the queue has been empty for a configurable timeout.
+                # This prevents "jittery" flushes during small network/processing gaps.
+                idle_timeout = float(os.getenv("IDLE_FLUSH_TIMEOUT", 1.5))
+                if (time.time() - idle_since) > idle_timeout:
+                    print(f"[PREP] Idle timeout ({idle_timeout}s) reached. Flushing silent clip to reset avatar.")
+                    audio_history_buffer, pose_idx = _perform_idle_flush(
+                        audio_history_buffer, history_samples, sample_rate, fps,
+                        pose_provider, pose_idx, prepared_queue, overlap_frames
+                    )
+                    has_flushed = True
+                    should_reset_after_flush = True
+                    idle_since = None 
+            else:
+                # If queue is not empty, reset the idle timer
+                if not audio_queue.empty():
+                    idle_since = None
                 empty_flush_count += 1
                 # Only reset after 3 consecutive empty/silent flushes
                 if empty_flush_count >= 1:
@@ -283,6 +307,9 @@ def video_generation_thread(
     use_init_latent: bool = True,
     audio_margin: int = 2,
     active_clips: Optional[list[int]] = None,
+    pose_provider: Optional[PoseProvider] = None,
+    args: Optional[argparse.Namespace] = None,
+    warmup_done_event: Optional[threading.Event] = None,
 ) -> None:
     """
     Unified video generation thread for 1..N GPUs.
@@ -306,6 +333,16 @@ def video_generation_thread(
 
     print(f"[GEN] Video generation started — {num_gpus} GPU(s), "
           f"overlap K={K}, clip_frames={clip_frames}, init_latent={use_init_latent}")
+
+    # Initialize Thread-Local Storage (TLS) for torch.compile (CUDA Graphs)
+    # by running warmup inside the starting thread.
+    if gpu_manager.compile_unet and pose_provider and args:
+        print("[GEN] Initializing CUDA Graphs via warmup in worker thread...")
+        warmup_pipeline(gpu_manager, ref_image, pose_provider, args)
+    
+    # Signal that warmup is complete (or skipped)
+    if warmup_done_event:
+        warmup_done_event.set()
 
     if is_multi:
         _run_multi_gpu_loop(
@@ -811,54 +848,81 @@ def postprocess_thread(
 # ---------------------------------------------------------------------------
 
 def warmup_pipeline(gpu_manager: MultiGPUManager, ref_image, pose_provider, args):
-    """Warmup all GPU pipelines."""
-    dummy_audio = np.zeros(args.sample_rate, dtype=np.float32)
+    """
+    Perform 4 warmup passes on all GPUs to trigger torch.compile optimization 
+    before the first user request. 
+    
+    This ensures that all permutations of init_latent (None vs Tensor) and 
+    audio_context (0 vs 12) are captured by the compiled graph using actual 
+    tensors from the model output for maximum consistency.
+    """
+    # Detect the actual video_length used in inference (including overlap if blending)
+    video_length = gpu_manager.clip_frames + gpu_manager.overlap_frames
+    
+    print(f"[WARM] Starting warmup on {gpu_manager.num_gpus} GPU(s) (4 permutations) ...")
+    print(f"[WARM] Warmup video_length: {video_length} (clip={gpu_manager.clip_frames}, overlap={gpu_manager.overlap_frames})\n")
+    
+    width, height = args.width, args.height
+    steps = args.steps
+    cfg = args.cfg
+    fps = args.fps
+    sample_rate = args.sample_rate
 
-    for i in range(gpu_manager.num_gpus):
-        pipe, device = gpu_manager.get_pipeline(i)
-        ref_cache = gpu_manager.reference_caches[i]
+    # We use a stateful approach to capture real latents
+    last_latents = [None] * gpu_manager.num_gpus
+    dummy_audio = np.zeros(sample_rate, dtype=np.float32)
+    poses_tensor = pose_provider.get_batch(0, video_length)
+    generator = torch.manual_seed(0)
 
-        try:
-            poses_tensor = pose_provider.get_batch(0, args.clip_frames)
-            generator = torch.manual_seed(0)
+    # Permutations: 
+    # Pass 1: NONE latent, 0 ctx
+    # Pass 2: REAL latent, 0 ctx
+    # Pass 3: NONE latent, 12 ctx
+    # Pass 4: REAL latent, 12 ctx
+    configs = [
+        {"has_idx": 0, "audio_ctx": 0},
+        {"has_idx": 1, "audio_ctx": 0}, 
+        {"has_idx": 0, "audio_ctx": gpu_manager.clip_frames},
+        {"has_idx": 1, "audio_ctx": gpu_manager.clip_frames},
+    ]
 
-            print(f"  [WARM] Warmup pass 1 (init_latents=None, ctx=0) on {device} ...")
-            with torch.no_grad():
-                result = pipe(
-                    ref_image, dummy_audio,
-                    poses_tensor[:, :, :args.clip_frames, ...],
-                    args.width, args.height, args.clip_frames, args.steps, args.cfg,
-                    generator=generator,
-                    audio_sample_rate=args.sample_rate,
-                    context_frames=12, fps=args.fps,
-                    context_overlap=3, start_idx=0,
-                    audio_margin=args.audio_margin,
-                    init_latents=None,
-                    reference_cache=ref_cache,
-                    audio_context_frames=0,
-                )
+    for pass_idx, cfg_perm in enumerate(configs, 1):
+        is_second_of_pair = (cfg_perm["has_idx"] == 1)
+        audio_ctx = cfg_perm["audio_ctx"]
+        
+        desc = "SET (Real Latent)" if is_second_of_pair else "NONE"
+        print(f"  [WARM] Pass {pass_idx}/4: init_latent={desc}, audio_context={audio_ctx}")
+        
+        for g in range(gpu_manager.num_gpus):
+            pipe, device = gpu_manager.get_pipeline(g)
+            ref_cache = gpu_manager.reference_caches[g]
             
-            # Pass 2: Warmup with init_latents and audio_context > 0
-            # This captures the variations used in actual inference.
-            if args.use_init_latent:
-                print(f"  [WARM] Warmup pass 2 (init_latents=Tensor, ctx=12) on {device} ...")
+            # Use real latent if this is the second of a pair, otherwise None
+            init_latent = last_latents[g] if is_second_of_pair else None
+
+            try:
                 with torch.no_grad():
-                    pipe(
+                    result = pipe(
                         ref_image, dummy_audio,
-                        poses_tensor[:, :, :args.clip_frames, ...],
-                        args.width, args.height, args.clip_frames, args.steps, args.cfg,
+                        poses_tensor[:, :, :video_length, ...],
+                        width, height, video_length, steps, cfg,
                         generator=generator,
-                        audio_sample_rate=args.sample_rate,
-                        context_frames=12, fps=args.fps,
+                        audio_sample_rate=sample_rate,
+                        context_frames=12, fps=fps,
                         context_overlap=3, start_idx=0,
                         audio_margin=args.audio_margin,
-                        init_latents=result.final_latent,
+                        init_latents=init_latent,
                         reference_cache=ref_cache,
-                        audio_context_frames=12,
+                        audio_context_frames=audio_ctx,
+                        output_type="tensor",
+                        return_dict=True
                     )
+                    # Capture latent for the next pass
+                    if hasattr(result, 'final_latent'):
+                        last_latents[g] = result.final_latent
+                    
+                print(f"    [GPU {g}] Pass {pass_idx} ok.")
+            except Exception as e:
+                print(f"    [GPU {g}] Pass {pass_idx} failed: {e}")
 
-            print(f"[INIT] Warmup complete on {device}.")
-
-        except Exception as e:
-            print(f"[WARN] Warmup failed on {device}: {e}")
-            import traceback; traceback.print_exc()
+    print("[WARM] Warmup complete.\n")

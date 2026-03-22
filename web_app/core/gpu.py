@@ -81,6 +81,7 @@ class MultiGPUManager:
         clip_frames: int = 12,
         width: int = 512,
         height: int = 512,
+        compile_unet: bool = False,
     ):
         self._num_gpus = max(1, detect_gpus())
         # Blending is always on for multi-GPU, or if forced for single-GPU
@@ -91,6 +92,7 @@ class MultiGPUManager:
         self.clip_frames = clip_frames
         self.width = width
         self.height = height
+        self.compile_unet = compile_unet
 
         # Per-GPU state
         self.pipes = [None] * self._num_gpus
@@ -114,7 +116,8 @@ class MultiGPUManager:
                 audio_model_type=audio_model_type, use_trt=self.use_trt,
                 quantize_fp8=self.fp8, clip_frames=self.clip_frames,
                 width=self.width, height=self.height,
-                overlap_frames=self.overlap_frames
+                overlap_frames=self.overlap_frames,
+                compile_unet=self.compile_unet
             )
         else:
             threads = []
@@ -129,7 +132,8 @@ class MultiGPUManager:
                         use_trt=self.use_trt, quantize_fp8=self.fp8,
                         clip_frames=self.clip_frames,
                         width=self.width, height=self.height,
-                        overlap_frames=self.overlap_frames
+                        overlap_frames=self.overlap_frames,
+                        compile_unet=self.compile_unet
                     )
                     print(f"[GPU] Pipeline {idx} ready on {self.devices[idx]}.")
                 except Exception as e:

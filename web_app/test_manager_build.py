@@ -12,7 +12,7 @@ print("Starting FULL TRT Export + Build Pipeline...")
 for f in [12]:
     print(f"\n--- Building for clip_frames={f} ---")
     try:
-        engine_path = manager.get_unet_engine(unet_pt_path, base_model_path=base_model_path, force_rebuild=True, clip_frames=f)
+        engine_path = manager.get_unet_engine(unet_pt_path, base_model_path=base_model_path, force_rebuild=True, clip_frames=f, fp8=False)
         print(f"Success! Engine for {f} frames at {engine_path}")
     except Exception as e:
         print(f"Build Failed for {f} frames: {e}")

@@ -181,6 +181,7 @@ def main() -> None:
         clip_frames=args.clip_frames,
         width=args.width,
         height=args.height,
+        compile_unet=args.compile_unet,
     )
 
     # Quantization (apply to all GPUs for non-TRT path)

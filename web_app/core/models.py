@@ -10,13 +10,14 @@ os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 # We assume `echomimic_v2` is importable. The entry point (app.py) handles sys.path
 from diffusers import AutoencoderKL, DDIMScheduler
 from diffusers.utils import is_accelerate_available
+from src.models.mutual_self_attention import ReferenceAttentionControl
 from src.models.unet_2d_condition import UNet2DConditionModel
 from src.models.unet_3d_emo import EMOUNet3DConditionModel
 from src.models.whisper.audio2feature import load_audio_model
 from src.pipelines.pipeline_echomimicv2_acc import EchoMimicV2Pipeline
 from src.models.pose_encoder import PoseEncoder
 
-def load_pipeline(config_path: str, device: str, weight_dtype: torch.dtype, echomimic_dir: str, audio_model_type: str = "whisper", use_trt: bool = False, quantize_fp8: bool = False, clip_frames: int = 12, width: int = 512, height: int = 512, overlap_frames: int = 0) -> EchoMimicV2Pipeline:
+def load_pipeline(config_path: str, device: str, weight_dtype: torch.dtype, echomimic_dir: str, audio_model_type: str = "whisper", use_trt: bool = False, quantize_fp8: bool = False, clip_frames: int = 12, width: int = 512, height: int = 512, overlap_frames: int = 0, compile_unet: bool = False) -> EchoMimicV2Pipeline:
     """Load all EchoMimic-v2 ACC models and return an assembled pipeline.
     
     Args:
@@ -155,6 +156,27 @@ def load_pipeline(config_path: str, device: str, weight_dtype: torch.dtype, echo
         engine_paths=engine_paths,
     )
     pipe = pipe.to(device, dtype=weight_dtype)
+
+    # [torch.compile Fix] Enable temporal attention patches before compilation
+    # This prevents torch.compile from omitting the reader/writer hooks.
+    if compile_unet:
+        print(f"[INIT] Initializing temporal attention patches on {device} for torch.compile ...")
+        # Initialize Reference Control Writer (Reference UNet)
+        ReferenceAttentionControl(
+            pipe.reference_unet,
+            do_classifier_free_guidance=True,
+            mode="write",
+            batch_size=1,
+            fusion_blocks="full"
+        )
+        # Initialize Reference Control Reader (Denoising UNet)
+        ReferenceAttentionControl(
+            pipe.denoising_unet,
+            do_classifier_free_guidance=True,
+            mode="read",
+            batch_size=1,
+            fusion_blocks="full"
+        )
 
     # Enable Flash Attention / Xformers if available
     if is_accelerate_available():
