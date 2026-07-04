@@ -108,9 +108,14 @@ class Audio2Feature():
             end_idx = int(emb['end'])
             emb_end_idx = int((end_idx - start_idx)/2)
             embed_list.append(encoder_embeddings[:emb_end_idx])
+            
+        print(f"\\n[WHISPER DEBUG LOG] model.transcribe() found {len(result['segments'])} segments in this audio chunk.")
+        
         if not embed_list:
              # Handle silence/empty result
+             print("[WHISPER DEBUG LOG] -> ERROR: embed_list is empty! Returning np.zeros. The lips will NOT move for this chunk!\\n")
              return np.zeros((0, 384), dtype=np.float32)
+             
         concatenated_array = np.concatenate(embed_list, axis=0)
         return concatenated_array
 

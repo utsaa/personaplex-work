@@ -1,0 +1,5 @@
+\n[WHISPER DEBUG LOG] model.transcribe() found 1 segments in this audio chunk.
+STRING SUM: 273771.94
+\n[WHISPER DEBUG LOG] model.transcribe() found 1 segments in this audio chunk.
+NUMPY SUM: 642484.5
+THE FEATURES ARE DIFFERENT!

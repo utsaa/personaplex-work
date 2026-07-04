@@ -1,0 +1,7 @@
+\n[WHISPER DEBUG LOG] model.transcribe() found 1 segments in this audio chunk.
+\n[WHISPER DEBUG LOG] model.transcribe() found 1 segments in this audio chunk.
+Original shape: (150, 5, 384)
+Padded shifted shape: (150, 5, 384)
+Mean absolute difference: 0.2329
+Original max: 123.2
+FEATURES ARE COMPLETELY DIFFERENT DUE TO SILENCE PADDING!

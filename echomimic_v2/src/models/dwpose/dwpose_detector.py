@@ -61,8 +61,11 @@ class DWposeDetector:
 
             return pose
 
+import os
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+BASE_DIR = os.path.abspath(os.path.join(SCRIPT_DIR, "../../../"))
 dwpose_detector = DWposeDetector(
-    model_det="your_path_to_yolox_l.onnx",
-    model_pose="your_path_to_dw-ll_ucoco_384.onnx",
+    model_det=os.path.join(BASE_DIR, "pretrained_weights/DWPose/yolox_l.onnx"),
+    model_pose=os.path.join(BASE_DIR, "pretrained_weights/DWPose/dw-ll_ucoco_384.onnx"),
     device=device)
 print('dwpose_detector init ok', device)

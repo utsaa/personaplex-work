@@ -18,7 +18,7 @@ weight_dtype: 'fp16'
 # We use a single fixed entry so your Python script doesn't have to keep changing the YAML
 test_cases:
   "./assets/therapist_ref.png":
-    - "../audio_video/therapist_response.wav"   # Audio from ChatTTS
+    - "./assets/halfbody_demo/audio/chinese/echomimicv2_woman.wav"   # Pristine test audio
     - "./assets/halfbody_demo/pose/01/"         # Default pose folder
 
 # --- 8GB VRAM OPTIMIZATIONS ---

@@ -1,5 +1,11 @@
 import argparse
 import os
+import sys
+
+# Ensure echomimic_v2 is in the python path
+echomimic_v2_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "echomimic_v2"))
+if echomimic_v2_path not in sys.path:
+    sys.path.append(echomimic_v2_path)
 import queue
 import threading
 import time
@@ -12,6 +18,10 @@ import numpy as np
 import torch
 import random
 from PIL import Image
+
+from diffusers.models import AutoencoderKL
+
+from src.models.mutual_self_attention import ReferenceAttentionControl
 
 from core.audio import _rms
 from core.gpu import MultiGPUManager, blend_overlap
@@ -83,6 +93,8 @@ def input_preparation_thread(
     vad_threshold: float = 0.005,
     audio_margin: int = 2,
     overlap_frames: int = 0,
+    audio_model_type: str = "whisper",
+    debug_way: bool = False,
 ) -> None:
     """
     Consumes raw audio chunks, performs VAD, prepares WAV/Pose inputs,
@@ -115,15 +127,42 @@ def input_preparation_thread(
           f"{clip_frames/fps:.1f}s new (overlap_frames={overlap_frames})")
     print(f"[PREP] Silence timeout: 1.0s (stop updating after {idle_clips_limit} silent clips)")
     
+    if debug_way:
+        from src.models.whisper.whisper.audio import load_audio
+        # Resolve path relative to web_app/core/workers.py -> ../../echomimic_v2/...
+        audio_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "echomimic_v2", "assets", "halfbody_demo", "audio", "chinese", "echomimicv2_woman.wav"))
+        test_audio = load_audio(audio_path)
+        test_audio = test_audio.astype(np.float32)
+        test_audio_idx = 0
+
     while not stop_event.is_set():
         # 1. Drain input queue
-        try:
-            while True:
+        if debug_way:
+            # [DEBUG OVERRIDE] Push pristine TTS audio automatically
+            chunk_len = 2048
+            if test_audio_idx + chunk_len > len(test_audio):
+                test_audio_idx = 0 # Loop audio
+            chunk = test_audio[test_audio_idx : test_audio_idx+chunk_len]
+            test_audio_idx += chunk_len
+            
+            incoming_audio_buffer = np.concatenate((incoming_audio_buffer, chunk))
+            idle_since = None
+            
+            # Drain any actual mic packets so they don't build up
+            while not audio_queue.empty():
+                try: audio_queue.get_nowait()
+                except: break
+        elif not audio_queue.empty():
+            try:
                 chunk = audio_queue.get_nowait()
+                
+                print(f"[PREP-DEBUG] Received chunk from audio_queue, length={len(chunk)}")
                 incoming_audio_buffer = np.concatenate((incoming_audio_buffer, chunk))
+                print(f"[PREP-DEBUG] incoming_audio_buffer size is now: {len(incoming_audio_buffer)} (target clip: {samples_per_clip})")
                 idle_since = None # Data arrived, reset idle timer
-        except queue.Empty:
-            pass
+            except queue.Empty:
+                print("[PREP-DEBUG] audio_queue was empty despite empty() check")
+                pass
 
         # 2. Process clips
         if len(incoming_audio_buffer) >= samples_per_clip:
@@ -175,9 +214,15 @@ def input_preparation_thread(
             else:
                 post_padding = np.array([], dtype=np.float32)
             
-            full_window = np.concatenate((audio_history_buffer, current_audio, post_padding))
-            ctx_duration = len(audio_history_buffer) / sample_rate
-            ctx_frames = int(ctx_duration * fps)
+            if audio_model_type == "whisper":
+                # Whisper features are position-dependent. Padding with history corrupts the embeddings.
+                full_window = np.concatenate((current_audio, post_padding))
+                ctx_frames = 0
+            else:
+                # Wav2Vec2 is convolutional and needs history context for the receptive field boundary.
+                full_window = np.concatenate((audio_history_buffer, current_audio, post_padding))
+                ctx_duration = len(audio_history_buffer) / sample_rate
+                ctx_frames = int(ctx_duration * fps)
 
             try:
                 # Prepare Pose Tensor using Provider
@@ -248,6 +293,47 @@ def input_preparation_thread(
 # Worker 2: Video Generation (GPU) — Unified for 1..N GPUs
 # ---------------------------------------------------------------------------
 
+def _build_reference_cache(pipe, ref_image, width, height, cfg):
+    device = pipe.vae.device
+    dtype = pipe.vae.dtype
+
+    # Prepare ref image latents
+    ref_image_tensor = pipe.ref_image_processor.preprocess(
+        ref_image, height=height, width=width
+    ).to(dtype=dtype, device=device)
+    
+    if getattr(pipe, 'use_trt', False) and "vae_encoder" in getattr(pipe, 'trt_models', {}):
+        out = pipe.trt_models["vae_encoder"].run({"input": ref_image_tensor})
+        ref_image_latents = out["latent"]
+    else:
+        ref_image_latents = pipe.vae.encode(ref_image_tensor).latent_dist.mean
+    
+    ref_image_latents = ref_image_latents * 0.18215 
+
+    # Initialize reference control writer
+    writer = ReferenceAttentionControl(
+        pipe.reference_unet,
+        do_classifier_free_guidance=(cfg > 1.0),
+        mode="write",
+        batch_size=1,
+        fusion_blocks=getattr(pipe, 'fusion_blocks', "full"),
+    )
+
+    # Run reference UNet
+    if not (getattr(pipe, 'use_trt', False) and "unet" in getattr(pipe, 'trt_models', {})):
+        pipe.reference_unet(
+            ref_image_latents,
+            torch.zeros(1, dtype=dtype, device=device),
+            encoder_hidden_states=None,
+            return_dict=False,
+        )
+
+    return {
+        "ref_image_latents": ref_image_latents,
+        "reference_control_writer": writer
+    }
+
+
 def generate_video_clip(
     pipe: object,
     ref_image: Image.Image,
@@ -271,7 +357,8 @@ def generate_video_clip(
         print(f"[GEN]   (Pipeline) Using provided init_latent (Temporal Continuity ON)")
     else:
         print(f"[GEN]   (Pipeline) No init_latent used (Temporal Continuity OFF)")
-    generator = torch.manual_seed(random.randint(0, 2**32 - 1))
+    generator = torch.manual_seed(42)
+    
     # Extend poses if shorter than clip_frames
     actual_pose_frames = poses_tensor.shape[2]
     if actual_pose_frames < clip_frames:
@@ -285,7 +372,7 @@ def generate_video_clip(
         W, H, clip_frames, steps, cfg,
         generator=generator,
         audio_sample_rate=sample_rate,
-        context_frames=clip_frames, fps=fps,
+        context_frames=12, fps=fps,
         context_overlap=3, start_idx=0,
         audio_margin=audio_margin, 
         init_latents=init_latent if use_init_latent else None,
@@ -363,10 +450,11 @@ def video_generation_thread(
             num_gpus, K, active_clips
         )
     else:
+        debug_way = args.debug_way if args else False
         _run_single_gpu_loop(
             gpu_manager, ref_image, prepared_queue, raw_clip_queue, stop_event,
             sample_rate, fps, clip_frames, W, H, steps, cfg,
-            use_init_latent, audio_margin, active_clips, K
+            use_init_latent, audio_margin, active_clips, K, debug_way
         )
 
 
@@ -387,9 +475,12 @@ def _run_single_gpu_loop(
     audio_margin: int,
     active_clips: list[int],
     K: int = 0,
+    debug_way: bool = False,
 ) -> None:
     """Single-GPU: sequential generation with optional blend or latent continuity."""
     pipe, device = gpu_manager.get_pipeline(0)
+    if gpu_manager.reference_caches[0] is None:
+        gpu_manager.reference_caches[0] = _build_reference_cache(pipe, ref_image, W, H, cfg)
     ref_cache = gpu_manager.reference_caches[0]
 
     is_first_chunk = True
@@ -525,6 +616,40 @@ def _run_single_gpu_loop(
 
             print(f"[GEN] Clip generated in {dt:.2f}s ({output_video.shape[2]} frames)")
             raw_clip_queue.put((output_video, current_audio))
+            
+            # [DEBUG] Save output video to disk for verification
+            if debug_way:
+                try:
+                    import imageio
+                    import datetime
+                    import soundfile as sf
+                    import subprocess
+                    
+                    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                    out_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", f"debug_output_{timestamp}.mp4"))
+                    tmp_video = out_path.replace(".mp4", "_tmp.mp4")
+                    tmp_audio = out_path.replace(".mp4", ".wav")
+                    
+                    # Write audio
+                    sf.write(tmp_audio, current_audio, sample_rate)
+                    
+                    # Write video
+                    writer = imageio.get_writer(tmp_video, fps=fps)
+                    frames_to_save = output_video[0] # (3, F, H, W)
+                    frames_to_save = frames_to_save.transpose(1, 2, 3, 0) # (F, H, W, 3)
+                    frames_to_save = (frames_to_save * 255).clip(0, 255).astype(np.uint8)
+                    for f_idx in range(frames_to_save.shape[0]):
+                        writer.append_data(frames_to_save[f_idx])
+                    writer.close()
+                    
+                    # Mux together
+                    subprocess.run(["ffmpeg", "-y", "-i", tmp_video, "-i", tmp_audio, "-c:v", "copy", "-c:a", "aac", out_path], capture_output=True)
+                    os.remove(tmp_video)
+                    os.remove(tmp_audio)
+                    
+                    print(f"[DEBUG] Wrote generated chunk with AUDIO to {out_path} for visual inspection.")
+                except Exception as e:
+                    print(f"[DEBUG] Failed to write debug output: {e}")
 
         except Exception as e:
             print(f"[GEN] Error: {e}")
@@ -554,8 +679,11 @@ def _gpu_generate_task(
     handled by the caller AFTER this function returns.
     """
     pipe, device = gpu_manager.get_pipeline(gpu_idx)
-    ref_cache = gpu_manager.reference_caches[gpu_idx % gpu_manager.num_gpus]
-
+    
+    cache_idx = gpu_idx % gpu_manager.num_gpus
+    if gpu_manager.reference_caches[cache_idx] is None:
+        gpu_manager.reference_caches[cache_idx] = _build_reference_cache(pipe, ref_image, W, H, cfg)
+    ref_cache = gpu_manager.reference_caches[cache_idx]
     video_np, _ = generate_video_clip(
         pipe, ref_image, audio_data,
         poses_tensor,
@@ -928,6 +1056,8 @@ def warmup_pipeline(gpu_manager: MultiGPUManager, ref_image, pose_provider, args
         
         for g in range(gpu_manager.num_gpus):
             pipe, device = gpu_manager.get_pipeline(g)
+            if gpu_manager.reference_caches[g] is None:
+                gpu_manager.reference_caches[g] = _build_reference_cache(pipe, ref_image, W, H, cfg)
             ref_cache = gpu_manager.reference_caches[g]
             
             # Use real latent if this is the second of a pair, otherwise None
@@ -941,7 +1071,7 @@ def warmup_pipeline(gpu_manager: MultiGPUManager, ref_image, pose_provider, args
                         width, height, video_length, steps, cfg,
                         generator=generator,
                         audio_sample_rate=sample_rate,
-                        context_frames=video_length, fps=fps,
+                        context_frames=12, fps=fps,
                         context_overlap=3, start_idx=0,
                         audio_margin=args.audio_margin,
                         init_latents=init_latent,

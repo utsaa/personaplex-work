@@ -1,0 +1,23 @@
+WARNING: SR is not 16000
+\n[WHISPER DEBUG LOG] model.transcribe() found 1 segments in this audio chunk.
+STRING SUM: 273771.94
+Traceback (most recent call last):
+  File "/workspace/personaplex-work/web_app/test_numpy_vs_str.py", line 21, in <module>
+    feat_np = audio_guider.audio2feat(audio_np)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/personaplex-work/echomimic_v2/src/models/whisper/audio2feature.py", line 101, in audio2feat
+    result = self.model.transcribe(audio_data)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/personaplex-work/echomimic_v2/src/models/whisper/whisper/transcribe.py", line 85, in transcribe
+    mel = log_mel_spectrogram(audio)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/personaplex-work/echomimic_v2/src/models/whisper/whisper/audio.py", line 115, in log_mel_spectrogram
+    stft = torch.stft(audio, N_FFT, HOP_LENGTH, window=window, return_complex=True)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/personaplex-work/web_app/.venv/lib/python3.11/site-packages/torch/functional.py", line 728, in stft
+    input = F.pad(input.view(extended_shape), [pad, pad], pad_mode)
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/personaplex-work/web_app/.venv/lib/python3.11/site-packages/torch/nn/functional.py", line 5290, in pad
+    return torch._C._nn.pad(input, pad, mode, value)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+RuntimeError: Argument #4: Padding size should be less than the corresponding input dimension, but got: padding (200, 200) at dimension 2 of input [1, 274176, 2]

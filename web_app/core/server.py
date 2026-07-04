@@ -59,6 +59,8 @@ async def run_server(
             "vad_threshold": args.vad_threshold,
             "audio_margin": args.audio_margin,
             "overlap_frames": gpu_manager.overlap_frames,
+            "audio_model_type": args.audio_model_type,
+            "debug_way": args.debug_way,
         },
         daemon=True
     )

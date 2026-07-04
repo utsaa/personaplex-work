@@ -60,6 +60,33 @@ def setup_logging() -> str:
     the log file, which Python-level redirection (sys.stdout) often misses.
     """
     import os
+    import sys
+    from datetime import datetime
+    
+    os.makedirs(LOGS_DIR, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_path = os.path.join(LOGS_DIR, f"run_{timestamp}.log")
+    
+    if sys.platform == 'win32':
+        print("[LOG] Using Python-level tee on Windows to prevent Console API crashes.")
+        log_file = open(log_path, "w", encoding="utf-8")
+        
+        class TeeLogger:
+            def __init__(self, original_stream):
+                self.original_stream = original_stream
+            def write(self, data):
+                self.original_stream.write(data)
+                log_file.write(data)
+                log_file.flush()
+            def flush(self):
+                self.original_stream.flush()
+                log_file.flush()
+                
+        sys.stdout = TeeLogger(sys.stdout)
+        sys.stderr = TeeLogger(sys.stderr)
+        return log_path
+
+    import os
     import threading
     
     os.makedirs(LOGS_DIR, exist_ok=True)
@@ -121,8 +148,8 @@ def main() -> None:
     parser.add_argument("--sample-rate", type=int, default=16000)
     parser.add_argument("--fps", type=int, default=24)
     parser.add_argument("--clip-frames", type=int, default=12)
-    parser.add_argument("--width", type=int, default=512)
-    parser.add_argument("--height", type=int, default=512)
+    parser.add_argument("--width", type=int, default=768)
+    parser.add_argument("--height", type=int, default=768)
     parser.add_argument("--steps", type=int, default=6)
     parser.add_argument("--cfg", type=float, default=2.5)
     parser.add_argument("--port", type=int, default=8080)
@@ -148,6 +175,8 @@ def main() -> None:
                         help="Disable pose pre-loading (saves ~1GB RAM but increases CPU latency).")
     parser.add_argument("--audio-model-type", type=str, default="whisper", choices=["whisper", "wav2vec2"],
                         help="Type of audio model to use for feature extraction.")
+    parser.add_argument("--debug-way", action="store_true",
+                        help="Enable debug way to fix Whisper chunking.")
     parser.add_argument("--overlap-frames", type=int, default=6,
                         help="Number of overlap frames (K) for multi-GPU blending. "
                              "Only used when >=2 GPUs are detected. Default: 6.")

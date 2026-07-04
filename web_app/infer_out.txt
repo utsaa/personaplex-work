@@ -1,0 +1,4 @@
+Traceback (most recent call last):
+  File "/workspace/personaplex-work/web_app/../echomimic_v2/infer_acc.py", line 29, in <module>
+    from moviepy.editor import VideoFileClip, AudioFileClip
+ModuleNotFoundError: No module named 'moviepy'

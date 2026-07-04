@@ -1,4 +1,3 @@
-
 import os
 from typing import List
 
@@ -25,23 +24,26 @@ def get_pose_tensor(
     imh_new, imw_new, rb, re, cb, ce = detected_pose["draw_pose_params"]
     im = draw_pose_select_v2(detected_pose, imh_new, imw_new, ref_w=800)
     im = np.transpose(np.array(im), (1, 2, 0))
-    # Draw into native-resolution canvas, then resize to target (W, H)
-    native_h = max(re, im.shape[0] + rb)
-    native_w = max(ce, im.shape[1] + cb)
-    tgt_musk = np.zeros((native_h, native_w, 3), dtype=np.uint8)
-    tgt_musk[rb:re, cb:ce, :] = im
-    tgt_musk_pil = Image.fromarray(tgt_musk).convert("RGB").resize((W, H), Image.LANCZOS)
     
-    # Return (C, H, W)
-    return (
-        torch.Tensor(np.array(tgt_musk_pil))
-        .to(dtype=dtype, device=device)
-        .permute(2, 0, 1) / 255.0
-    )
+    # EXACT MATCH WITH INFER_ACC.PY!
+    # Dynamically determine the required canvas size from the .npy boundaries
+    # to support BOTH the 768x768 demo poses AND any custom 512x512 poses you make!
+    canvas_w = max(W, ce)
+    canvas_h = max(H, re)
+    
+    tgt_musk = np.zeros((canvas_h, canvas_w, 3)).astype('uint8')
+    tgt_musk[rb:re, cb:ce, :] = im
+    tgt_musk_pil = Image.fromarray(np.array(tgt_musk)).convert('RGB')
+    
+    # If the user requested a different target resolution, resize the fully drawn pose canvas
+    if tgt_musk_pil.size != (W, H):
+        tgt_musk_pil = tgt_musk_pil.resize((W, H))
+    
+    pose_tensor = torch.from_numpy(np.array(tgt_musk_pil).astype(np.float32) / 255.0).permute(2, 0, 1)
+    return pose_tensor.to(dtype=dtype, device=device)
 
 class PoseProvider:
     def get_batch(self, start_idx: int, num_frames: int) -> torch.Tensor:
-        """Returns (1, F, C, H, W) tensor batch."""
         raise NotImplementedError
 
 class OnTheFlyPoseProvider(PoseProvider):
@@ -72,14 +74,6 @@ class OnTheFlyPoseProvider(PoseProvider):
             )
             pose_list.append(pose_tensor)
         
-        # Stack (F, C, H, W) -> Permute (C, F, H, W) -> Unsqueeze (1, C, F, H, W)
-        # Wait, original code was: stack(dim=1).unsqueeze(0).
-        # Assuming prepare_pose_tensor returned (1, C, F, H, W).
-        # Let's verify original code structure.
-        # Original: torch.stack(pose_list, dim=1).unsqueeze(0)
-        # pose_list elements are (C, H, W).
-        # stack dim=1 implies (C, F, H, W). 
-        # unsqueeze(0) implies (1, C, F, H, W). Correct.
         return torch.stack(pose_list, dim=1).unsqueeze(0)
 
 class PreloadedPoseProvider(PoseProvider):
@@ -96,7 +90,6 @@ class PreloadedPoseProvider(PoseProvider):
         self.device = device
         self.tensors: List[torch.Tensor] = []
         for i, f in enumerate(pose_files):
-             # Load but store on CPU
              t = get_pose_tensor(pose_dir, f, W, H, "cpu", dtype)
              self.tensors.append(t)
              if i % 50 == 0:
