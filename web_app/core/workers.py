@@ -18,6 +18,7 @@ import numpy as np
 import torch
 import random
 from PIL import Image
+from core.signals import ClientSignal
 
 from diffusers.models import AutoencoderKL
 
@@ -69,7 +70,7 @@ def _perform_idle_flush(
         new_pose_idx = pose_idx + flush_frames
         
         # Backlog is no longer passed here; calculated real-time in the loop
-        batch = (full_window, poses_tensor, ctx_frames, silent_clip.copy(), False)
+        batch = (full_window, poses_tensor, ctx_frames, silent_clip.copy(), False, flush_frames)
         prepared_queue.put(batch)
         
         # Update history with the silence we just "sent"
@@ -95,10 +96,13 @@ def input_preparation_thread(
     overlap_frames: int = 0,
     audio_model_type: str = "whisper",
     debug_way: bool = False,
+    compile_unet: bool = False,
+    stream_video: bool = False,
+    stream_padding: bool = False,
 ) -> None:
     """
     Consumes raw audio chunks, performs VAD, prepares WAV/Pose inputs,
-    and pushes `(audio_data, poses_tensor, ctx_frames, audio_chunk, reset_latent)` 
+    and pushes `(audio_data, poses_tensor, ctx_frames, audio_chunk, reset_latent, actual_clip_frames)` 
     to `prepared_queue`.
     """
     samples_per_clip = int(sample_rate * clip_frames / fps)
@@ -121,6 +125,7 @@ def input_preparation_thread(
     should_reset_after_flush = False
     empty_flush_count = 0
     idle_since = None  # Timer to prevent excessive flushing
+    manual_flush_requested = False
 
     print(f"[PREP] Waiting for audio (target clip: {samples_per_clip} samples) ...")
     print(f"[PREP] Audio Context: {history_samples/sample_rate:.2f}s history + "
@@ -153,16 +158,19 @@ def input_preparation_thread(
                 try: audio_queue.get_nowait()
                 except: break
         elif not audio_queue.empty():
-            try:
-                chunk = audio_queue.get_nowait()
-                
-                print(f"[PREP-DEBUG] Received chunk from audio_queue, length={len(chunk)}")
-                incoming_audio_buffer = np.concatenate((incoming_audio_buffer, chunk))
-                print(f"[PREP-DEBUG] incoming_audio_buffer size is now: {len(incoming_audio_buffer)} (target clip: {samples_per_clip})")
-                idle_since = None # Data arrived, reset idle timer
-            except queue.Empty:
-                print("[PREP-DEBUG] audio_queue was empty despite empty() check")
-                pass
+            while not audio_queue.empty():
+                try:
+                    chunk = audio_queue.get_nowait()
+                    if isinstance(chunk, ClientSignal) and chunk == ClientSignal.FLUSH_REQUEST:
+                        if stream_video:
+                            print("[PREP] Received manual FLUSH_REQUEST from UI.")
+                            manual_flush_requested = True
+                    else:
+                        incoming_audio_buffer = np.concatenate((incoming_audio_buffer, chunk))
+                        idle_since = None # Data arrived, reset idle timer
+                except queue.Empty:
+                    print("[PREP-DEBUG] audio_queue was empty despite empty() check")
+                    break
 
         # 2. Process clips
         if len(incoming_audio_buffer) >= samples_per_clip:
@@ -232,7 +240,7 @@ def input_preparation_thread(
                 pose_idx = pose_idx + clip_frames
 
                 # Push to GPU thread
-                batch = (full_window, poses_tensor, ctx_frames, current_audio.copy(), reset_latent)
+                batch = (full_window, poses_tensor, ctx_frames, current_audio.copy(), reset_latent, clip_frames)
                 prepared_queue.put(batch)
                 active_clips[0] += 1
 
@@ -249,41 +257,85 @@ def input_preparation_thread(
                 print(f"[PREP] Error: {e}")
                 pass
         else:
-            # 3. Handle empty queue / idle flush
-            if audio_queue.empty() and not has_flushed and len(incoming_audio_buffer) < samples_per_clip:
-                if idle_since is None:
+            # 3. Handle empty queue / idle flush / manual flush
+            if manual_flush_requested or (audio_queue.empty() and not has_flushed and len(incoming_audio_buffer) < samples_per_clip):
+                if idle_since is None and not manual_flush_requested:
                     idle_since = time.time()
                 
-                # Only flush if the queue has been empty for a configurable timeout.
-                # This prevents "jittery" flushes during small network/processing gaps.
                 idle_timeout = float(os.getenv("IDLE_FLUSH_TIMEOUT", 1.5))
-                if (time.time() - idle_since) > idle_timeout:
+                if manual_flush_requested or (idle_since is not None and (time.time() - idle_since) > idle_timeout):
                     if len(incoming_audio_buffer) > 0:
-                        pad_samples = samples_per_clip - len(incoming_audio_buffer)
-                        print(f"[PREP] Idle timeout ({idle_timeout}s) reached. Padding {len(incoming_audio_buffer)/sample_rate:.2f}s of pending audio with silence to complete clip.")
-                        silence_pad = np.zeros(pad_samples, dtype=np.float32)
-                        incoming_audio_buffer = np.concatenate((incoming_audio_buffer, silence_pad))
+                        if compile_unet or stream_padding:
+                            pad_samples = samples_per_clip - len(incoming_audio_buffer)
+                            if manual_flush_requested:
+                                print(f"[PREP] Manual flush: Padding {len(incoming_audio_buffer)/sample_rate:.2f}s of audio with silence.")
+                            else:
+                                print(f"[PREP] Idle timeout: Padding {len(incoming_audio_buffer)/sample_rate:.2f}s of audio with silence.")
+                            silence_pad = np.zeros(pad_samples, dtype=np.float32)
+                            current_audio = np.concatenate((incoming_audio_buffer, silence_pad))
+                            actual_clip_frames = clip_frames
+                        else:
+                            # Process shorter clip immediately
+                            current_audio = incoming_audio_buffer
+                            
+                            clip_rms = _rms(current_audio)
+                            
+                            actual_clip_frames = max(1, int(np.ceil(len(current_audio) / sample_rate * fps)))
+                            expected_samples = int(actual_clip_frames * sample_rate / fps)
+                            
+                            if len(current_audio) < expected_samples:
+                                pad = np.zeros(expected_samples - len(current_audio), dtype=np.float32)
+                                current_audio = np.concatenate([current_audio, pad])
+
+                            if manual_flush_requested:
+                                print(f"[PREP] Manual flush: Processing short clip ({len(current_audio)} samples) without padding.")
+                            else:
+                                print(f"[PREP] Idle timeout: Processing short clip ({len(current_audio)} samples) without padding.")
+
+                        incoming_audio_buffer = np.array([], dtype=np.float32)
+
+                        if audio_model_type == "whisper":
+                            full_window = current_audio
+                            ctx_frames = 0
+                        else:
+                            full_window = np.concatenate((audio_history_buffer, current_audio))
+                            ctx_duration = len(audio_history_buffer) / sample_rate
+                            ctx_frames = int(ctx_duration * fps)
+
+                        num_poses = actual_clip_frames + overlap_frames
+                        poses_tensor = pose_provider.get_batch(pose_idx, num_poses)
+                        pose_idx = pose_idx + actual_clip_frames
+
+                        batch = (full_window, poses_tensor, ctx_frames, current_audio.copy(), True if should_reset_after_flush else False, actual_clip_frames)
+                        prepared_queue.put(batch)
+                        active_clips[0] += 1
+                        audio_history_buffer = np.concatenate((audio_history_buffer, current_audio))[-history_samples:]
+
+                    if manual_flush_requested:
+                        print("[PREP] Manual flush: Sending FLUSH_SENTINEL.")
                     else:
-                        print(f"[PREP] Idle timeout ({idle_timeout}s) reached. Flushing silent clip to reset avatar.")
+                        print(f"[PREP] Idle timeout: Flushing silent clip to reset avatar.")
                         audio_history_buffer, pose_idx = _perform_idle_flush(
                             audio_history_buffer, history_samples, sample_rate, fps,
                             pose_provider, pose_idx, prepared_queue, overlap_frames
                         )
-                        # Push explicit flush token AFTER the silent clip
-                        prepared_queue.put(FLUSH_SENTINEL)
-                        
-                        has_flushed = True
-                        should_reset_after_flush = True
+                    # Push explicit flush token AFTER any silent clip
+                    prepared_queue.put(FLUSH_SENTINEL)
+                    
+                    has_flushed = True
+                    should_reset_after_flush = True
+                    manual_flush_requested = False
                     idle_since = None 
             else:
                 # If queue is not empty, reset the idle timer
-                if not audio_queue.empty():
+                if not audio_queue.empty() and not manual_flush_requested:
                     idle_since = None
-                empty_flush_count += 1
-                # Only reset after 3 consecutive empty/silent flushes
-                if empty_flush_count >= 1:
-                    should_reset_after_flush = True
-                    empty_flush_count = 0
+                if not manual_flush_requested:
+                    empty_flush_count += 1
+                    # Only reset after 3 consecutive empty/silent flushes
+                    if empty_flush_count >= 1:
+                        should_reset_after_flush = True
+                        empty_flush_count = 0
             
             # Wait a bit if not enough audio
             time.sleep(0.005)
@@ -508,7 +560,7 @@ def _run_single_gpu_loop(
             raw_clip_queue.put(FLUSH_SENTINEL)
             continue
 
-        audio_data, poses_tensor, ctx_frames, current_audio, reset_latent = batch
+        audio_data, poses_tensor, ctx_frames, current_audio, reset_latent, actual_clip_frames = batch
 
         if reset_latent:
             gpu_manager.last_latents[0] = None
@@ -527,7 +579,7 @@ def _run_single_gpu_loop(
             # Determine frames and audio: ALWAYS use clip_frames + K if K > 0 
             # to keep shapes constant for torch.compile / CUDA Graphs.
             if K > 0:
-                gen_frames = clip_frames + K
+                gen_frames = actual_clip_frames + K
                 if is_first_chunk:
                     # First chunk: pad audio with repeat to reach gen_frames
                     if len(audio_data) >= samples_per_clip:
@@ -556,7 +608,7 @@ def _run_single_gpu_loop(
                 
                 prev_current_audio = current_audio.copy()
             else:
-                gen_frames = clip_frames
+                gen_frames = actual_clip_frames
                 final_audio = audio_data
                 final_ctx = ctx_frames
 
@@ -593,8 +645,8 @@ def _run_single_gpu_loop(
                 # Apply blending if K > 0
                 if K > 0:
                     if is_first_chunk:
-                        # First chunk: output only first clip_frames, save tail K
-                        output_video = video_np[:, :, :clip_frames, :, :]
+                        # First chunk: output only first actual_clip_frames, save tail K
+                        output_video = video_np[:, :, :actual_clip_frames, :, :]
                         if video_np.shape[2] >= gen_frames:
                             tail_buffer = video_np[:, :, -K:, :, :].copy()
                         is_first_chunk = False
@@ -605,9 +657,9 @@ def _run_single_gpu_loop(
                                 blended,
                                 video_np[:, :, K:gen_frames, :, :]
                             ], axis=2)
-                            output_video = output_video[:, :, -clip_frames:, :, :]
+                            output_video = output_video[:, :, -actual_clip_frames:, :, :]
                         else:
-                            output_video = video_np[:, :, -clip_frames:, :, :]
+                            output_video = video_np[:, :, -actual_clip_frames:, :, :]
                         
                         if video_np.shape[2] >= gen_frames:
                             tail_buffer = video_np[:, :, -K:, :, :].copy()
@@ -764,7 +816,7 @@ def _run_multi_gpu_loop(
                 continue
 
             if batch is not None:
-                audio_data, poses_tensor, ctx_frames, current_audio, reset_latent = batch
+                audio_data, poses_tensor, ctx_frames, current_audio, reset_latent, actual_clip_frames = batch
 
                 if reset_latent:
                     # Wait for all pending futures to finish before resetting
@@ -787,7 +839,7 @@ def _run_multi_gpu_loop(
                 # ALWAYS use gen_frames = clip_frames + K if K > 0
                 # to keep shapes constant for torch.compile / CUDA Graphs.
                 if K > 0:
-                    gen_frames = clip_frames + K
+                    gen_frames = actual_clip_frames + K
                     if is_first_chunk:
                         # Pad audio for the extra K frames
                         k_audio_pad = audio_data[-k_samples:] if len(audio_data) >= k_samples else np.zeros(k_samples, dtype=np.float32)
@@ -806,9 +858,9 @@ def _run_multi_gpu_loop(
                             k_audio = np.zeros(k_samples, dtype=np.float32)
 
                         # Split audio_data into history and current parts
-                        if len(audio_data) > samples_per_clip:
-                            history_part = audio_data[:-samples_per_clip]
-                            current_part = audio_data[-samples_per_clip:]
+                        if len(audio_data) > len(current_audio):
+                            history_part = audio_data[:-len(current_audio)]
+                            current_part = audio_data[-len(current_audio):]
                         else:
                             history_part = np.array([], dtype=np.float32)
                             current_part = audio_data
@@ -817,7 +869,7 @@ def _run_multi_gpu_loop(
                         final_audio = np.concatenate([history_part, k_audio, current_part])
                         final_ctx = ctx_frames  # Full context preserved
                 else:
-                    gen_frames = clip_frames
+                    gen_frames = actual_clip_frames
                     final_audio = audio_data
                     final_ctx = ctx_frames
 
@@ -831,7 +883,7 @@ def _run_multi_gpu_loop(
                     gen_frames, W, H, sample_rate, fps, steps, cfg, audio_margin,
                     final_ctx,
                 )
-                pending.append((future, current_audio, gen_frames, gpu_idx, is_first_chunk, backlog_secs))
+                pending.append((future, current_audio, gen_frames, gpu_idx, is_first_chunk, backlog_secs, actual_clip_frames))
 
                 # After first dispatch, subsequent chunks are no longer "first"
                 if is_first_chunk:
@@ -841,7 +893,7 @@ def _run_multi_gpu_loop(
 
             # ---- Process: check if the HEAD future is done (in-order) ----
             while pending and not stop_event.is_set():
-                head_future, head_audio, head_gen_frames, head_gpu, head_was_first, head_backlog = pending[0]
+                head_future, head_audio, head_gen_frames, head_gpu, head_was_first, head_backlog, head_actual_clip_frames = pending[0]
 
                 if not head_future.done():
                     break  # Head not ready yet — don't skip ahead
@@ -860,9 +912,9 @@ def _run_multi_gpu_loop(
 
                 # ---- Blend and produce output ----
                 if head_was_first:
-                    # First chunk: output only first clip_frames, save tail K
+                    # First chunk: output only first head_actual_clip_frames, save tail K
                     if K > 0:
-                        output_video = video_np[:, :, :clip_frames, :, :]
+                        output_video = video_np[:, :, :head_actual_clip_frames, :, :]
                     else:
                         output_video = video_np
                     
@@ -876,10 +928,10 @@ def _run_multi_gpu_loop(
                             blended,
                             video_np[:, :, K:, :, :]
                         ], axis=2)
-                        # Only send the last clip_frames
-                        output_video = output_video[:, :, -clip_frames:, :, :]
+                        # Only send the last actual_clip_frames
+                        output_video = output_video[:, :, -head_actual_clip_frames:, :, :]
                     else:
-                        output_video = video_np[:, :, -clip_frames:, :, :]
+                        output_video = video_np[:, :, -head_actual_clip_frames:, :, :]
 
                     # Update tail buffer for next chunk
                     if K > 0 and video_np.shape[2] >= K:
@@ -908,16 +960,16 @@ def _drain_pending(
 ) -> None:
     """Wait for and process all pending futures before a reset."""
     while pending:
-        future, audio, gen_frames, gpu_idx, was_first, backlog = pending.popleft()
+        future, audio, gen_frames, gpu_idx, was_first, backlog, p_actual_clip_frames = pending.popleft()
         try:
             video_np = future.result(timeout=GPU_RESULT_TIMEOUT_S)
             if video_np is None:
                 continue
 
             if was_first:
-                # First chunk: output only first clip_frames, save tail K
+                # First chunk: output only first p_actual_clip_frames, save tail K
                 if K > 0:
-                    output_video = video_np[:, :, :clip_frames, :, :]
+                    output_video = video_np[:, :, :p_actual_clip_frames, :, :]
                 else:
                     output_video = video_np
                 
@@ -929,9 +981,9 @@ def _drain_pending(
                     output_video = np.concatenate([
                         blended, video_np[:, :, K:, :, :]
                     ], axis=2)
-                    output_video = output_video[:, :, -clip_frames:, :, :]
+                    output_video = output_video[:, :, -p_actual_clip_frames:, :, :]
                 else:
-                    output_video = video_np[:, :, -clip_frames:, :, :]
+                    output_video = video_np[:, :, -p_actual_clip_frames:, :, :]
 
                 if K > 0 and video_np.shape[2] >= K:
                     tail_buffer = video_np[:, :, -K:, :, :].copy()

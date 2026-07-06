@@ -74,6 +74,7 @@
     <button id="startBtn" onclick="start()">Start</button>
     <button id="micToggle" onclick="toggleMic()" disabled>🎙️ Mic On</button>
     <button id="stopBtn" onclick="stop()" disabled>Stop</button>
+    <button id="flushBtn" onclick="sendFlush()" disabled>Force Flush</button>
   </div>
   <div id="status">Click Start to begin.</div>
   <div id="vad-indicator" style="font-size:12px;color:#555;margin:4px;">VAD: idle</div>
@@ -89,6 +90,10 @@
     // ---------------------------------------------------------------------------
     const VIDEO_W = 512;
     const VIDEO_H = 512;
+
+    const ClientSignal = {
+      FLUSH_REQUEST: "FLUSH_REQUEST"
+    };
 
     let ws, micCtx, source, processor, stream, playCtx, playNextTime;
     let micMuted = false;  // When true, don't send audio to server
@@ -272,6 +277,7 @@
           document.getElementById('startBtn').disabled = true;
           document.getElementById('stopBtn').disabled = false;
           document.getElementById('micToggle').disabled = false;
+          document.getElementById('flushBtn').disabled = false;
           setStatus('Buffering...');
         } catch (err) {
           setStatus('Mic error: ' + err.message);
@@ -370,6 +376,13 @@
       micBtn.classList.remove('muted');
       document.getElementById('startBtn').disabled = false;
       document.getElementById('stopBtn').disabled = true;
+      document.getElementById('flushBtn').disabled = true;
+    }
+
+    function sendFlush() {
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(ClientSignal.FLUSH_REQUEST);
+      }
     }
   </script>
 

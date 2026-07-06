@@ -184,6 +184,10 @@ def main() -> None:
                         help="Enable TensorRT accelerated inference (disabled by default). Use --use-trt to enable.")
     parser.add_argument("--use-blend", action=argparse.BooleanOptionalAction, default=False,
                         help="Enable overlap-blending on single GPU (disables init-latent).")
+    parser.add_argument("--stream-video", action="store_true",
+                        help="Enable UI force flush button and streaming mode.")
+    parser.add_argument("--stream-padding", action="store_true",
+                        help="Pad audio buffer when streaming (always enabled if --compile-unet).")
     
     args = parser.parse_args()
 

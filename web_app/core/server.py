@@ -16,6 +16,7 @@ from core.workers import (
     postprocess_thread,
     warmup_pipeline
 )
+from core.signals import ClientSignal
 
 async def run_server(
     gpu_manager: MultiGPUManager,
@@ -61,6 +62,9 @@ async def run_server(
             "overlap_frames": gpu_manager.overlap_frames,
             "audio_model_type": args.audio_model_type,
             "debug_way": args.debug_way,
+            "compile_unet": getattr(args, "compile_unet", False),
+            "stream_video": getattr(args, "stream_video", False),
+            "stream_padding": getattr(args, "stream_padding", False),
         },
         daemon=True
     )
@@ -154,6 +158,13 @@ async def run_server(
                         input_queue.put_nowait(chunk)
                     except queue.Full:
                         pass
+                elif msg.type == web.WSMsgType.TEXT:
+                    if getattr(args, "stream_video", False) and msg.data == ClientSignal.FLUSH_REQUEST.value:
+                        try:
+                            input_queue.put_nowait(ClientSignal.FLUSH_REQUEST)
+                            print("[WEB] Received manual FLUSH_REQUEST from client.")
+                        except queue.Full:
+                            pass
                 elif msg.type in (web.WSMsgType.ERROR, web.WSMsgType.CLOSE):
                     break
         finally:
