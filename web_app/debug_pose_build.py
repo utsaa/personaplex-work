@@ -7,7 +7,8 @@ sys.path.append(os.getcwd())
 
 from core.trt.manager import TRTEngineManager
 
-echomimic_dir = "/workspace/personaplex-work/echomimic_v2"
+import os
+echomimic_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "echomimic_v2")
 pose_pt_path = os.path.join(echomimic_dir, "pretrained_weights/pose_encoder.pth")
 
 manager = TRTEngineManager(echomimic_dir)

@@ -1,7 +1,8 @@
 import sys
 import numpy as np
 import torch
-sys.path.append("/workspace/personaplex-work/echomimic_v2/src/models/whisper")
+import os
+sys.path.append(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "echomimic_v2", "src", "models", "whisper"))
 import whisper
 model = whisper.load_model("tiny", device="cuda")
 # create 2.5 seconds of fake audio

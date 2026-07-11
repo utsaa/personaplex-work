@@ -1,7 +1,8 @@
 import tensorrt as trt
 import os
 
-engine_file = "/workspace/personaplex-work/echomimic_v2/engines/nvidia_geforce_rtx_4090/denoising_unet_acc_f18.engine"
+import os
+engine_file = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "echomimic_v2", "engines", "nvidia_geforce_rtx_4090", "denoising_unet_acc_f18.engine")
 
 if not os.path.exists(engine_file):
     print(f"❌ ERROR: File not found: {engine_file}")

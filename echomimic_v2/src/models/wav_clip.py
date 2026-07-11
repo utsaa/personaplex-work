@@ -46,12 +46,14 @@ class AudioFeatureMapper(ModelMixin):
         return result
 
 def test():
+    import os
+    _base_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
     #加载模型
-    model_path = "/ossfs/workspace/projects/model_weights/Moore-AnimateAnyone/wav2vec2-base-960h"
+    model_path = os.path.join(_base_dir, "..", "..", "projects", "model_weights", "Moore-AnimateAnyone", "wav2vec2-base-960h")
     model = Wav2Vec(model_path)
     print("### model loaded ###")
     #加载音频
-    audio_path = "/ossfs/workspace/projects/Moore-AnimateAnyone-master/assets/taken_clip.wav"
+    audio_path = os.path.join(_base_dir, "..", "..", "projects", "Moore-AnimateAnyone-master", "assets", "taken_clip.wav")
     input_audio, rate = librosa.load(audio_path, sr=16000)
     print(f"输入shape: {input_audio.shape}, rate: {rate}")
 

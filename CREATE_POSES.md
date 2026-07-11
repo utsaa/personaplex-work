@@ -12,6 +12,14 @@ This is the static picture of the person you want to animate (e.g., `therapist_r
   uv run python align_image.py --input raw_image.png --output aligned_image.png
   ```
 
+  **Note on DWPose Weights**: The `align_image.py` script requires DWPose models to detect the skeleton. If it crashes with a `NoSuchFile` error, you must manually download the missing weights. Run this from your `echomimic_v2` directory:
+  
+  ```bash
+  mkdir -p pretrained_weights/DWPose
+  curl -L -o pretrained_weights/DWPose/yolox_l.onnx https://huggingface.co/yzd-v/DWPose/resolve/main/yolox_l.onnx?download=true
+  curl -L -o pretrained_weights/DWPose/dw-ll_ucoco_384.onnx https://huggingface.co/yzd-v/DWPose/resolve/main/dw-ll_ucoco_384.onnx?download=true
+  ```
+
 ## 2. The Driving Poses (`.npy` files)
 This is the skeleton animation (the actual movement of the head and body over time). 
 - It is **not** an image. It is a folder (like `pose/02/` or `pose/therapist_g/`) containing hundreds of `.npy` data files.

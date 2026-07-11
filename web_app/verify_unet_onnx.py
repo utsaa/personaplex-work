@@ -8,7 +8,8 @@ import subprocess
 from omegaconf import OmegaConf
 
 # Add echomimic_v2 to path
-ECHOMIMIC_DIR = "/workspace/personaplex-work/echomimic_v2"
+import os
+ECHOMIMIC_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "echomimic_v2")
 if ECHOMIMIC_DIR not in sys.path:
     sys.path.insert(0, ECHOMIMIC_DIR)
 
@@ -195,9 +196,9 @@ def verify_accuracy(onnx_path, pt_path, base_model_path):
         print("❌ Accuracy Check Failed (Max Diff >= 0.01)", flush=True)
 
 if __name__ == "__main__":
-    onnx_file = "/workspace/personaplex-work/echomimic_v2/engines/nvidia_geforce_rtx_4090/denoising_unet_acc_f12_512x512.onnx"
-    pt_file = "/workspace/personaplex-work/echomimic_v2/pretrained_weights/denoising_unet_acc.pth"
-    base_model = "/workspace/personaplex-work/echomimic_v2/pretrained_weights/sd-image-variations-diffusers"
+    onnx_file = os.path.join(ECHOMIMIC_DIR, "engines", "nvidia_geforce_rtx_4090", "denoising_unet_acc_f12_512x512.onnx")
+    pt_file = os.path.join(ECHOMIMIC_DIR, "pretrained_weights", "denoising_unet_acc.pth")
+    base_model = os.path.join(ECHOMIMIC_DIR, "pretrained_weights", "sd-image-variations-diffusers")
 
     if not os.path.exists(onnx_file):
         print(f"ERROR: ONNX file not found: {onnx_file}", flush=True)

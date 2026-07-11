@@ -157,7 +157,7 @@ def input_preparation_thread(
             while not audio_queue.empty():
                 try: audio_queue.get_nowait()
                 except: break
-        elif not audio_queue.empty():
+        elif not audio_queue.empty() and not manual_flush_requested:
             while not audio_queue.empty():
                 try:
                     chunk = audio_queue.get_nowait()
@@ -165,6 +165,7 @@ def input_preparation_thread(
                         if stream_video:
                             print("[PREP] Received manual FLUSH_REQUEST from UI.")
                             manual_flush_requested = True
+                            break
                     else:
                         incoming_audio_buffer = np.concatenate((incoming_audio_buffer, chunk))
                         idle_since = None # Data arrived, reset idle timer

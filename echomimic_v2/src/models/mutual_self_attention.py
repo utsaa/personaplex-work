@@ -202,10 +202,14 @@ class ReferenceAttentionControl:
                         # print("Audio Cross-Attention shapes:", norm_hidden_states.shape, audio_cond_fea.shape)
                         if audio_feature_ratio > 0:
                             # print('#'*5, norm_hidden_states.shape, audio_cond_fea.shape)
+                            _audio_cond_fea = audio_cond_fea
+                            if _audio_cond_fea is not None and len(_audio_cond_fea.shape) == 4:
+                                _audio_cond_fea = rearrange(_audio_cond_fea, "b f n c -> (b f) n c")
+                            
                             hidden_states = (
                                 self.attn2(
                                     norm_hidden_states,
-                                    encoder_hidden_states=audio_cond_fea, # B * 50 * 768，
+                                    encoder_hidden_states=_audio_cond_fea, # B * 50 * 768，
                                     attention_mask=attention_mask,
                                 ) * audio_feature_ratio
                                 + hidden_states

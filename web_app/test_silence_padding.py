@@ -1,14 +1,15 @@
 import sys
 import numpy as np
 import torch
-sys.path.append("/workspace/personaplex-work/echomimic_v2")
+import os
+sys.path.append(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "echomimic_v2"))
 from src.models.whisper.audio2feature import Audio2Feature
 from src.models.whisper.whisper.audio import load_audio
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
-audio_guider = Audio2Feature(model_path="/workspace/personaplex-work/echomimic_v2/pretrained_weights/audio_processor/tiny.pt", device=device)
+audio_guider = Audio2Feature(model_path=os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "echomimic_v2", "pretrained_weights", "audio_processor", "tiny.pt"), device=device)
 
-wav_path = "/workspace/personaplex-work/echomimic_v2/assets/halfbody_demo/audio/chinese/echomimicv2_woman.wav"
+wav_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "echomimic_v2", "assets", "halfbody_demo", "audio", "chinese", "echomimicv2_woman.wav")
 audio_np = load_audio(wav_path)[:16000 * 3] # 3.0s of speech
 
 silence = np.zeros(16000 * 2, dtype=np.float32) # 2.0s of silence

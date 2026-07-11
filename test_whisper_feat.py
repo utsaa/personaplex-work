@@ -3,16 +3,17 @@ import os
 import numpy as np
 
 # add path
-sys.path.append("/workspace/personaplex-work/echomimic_v2")
+import os
+sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), "echomimic_v2"))
 from src.models.whisper.audio2feature import load_audio_model
 from src.models.whisper.whisper.audio import load_audio
 
 def main():
-    audio_path = "/workspace/personaplex-work/echomimic_v2/assets/halfbody_demo/audio/chinese/echomimicv2_woman.wav"
+    audio_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "echomimic_v2", "assets", "halfbody_demo", "audio", "chinese", "echomimicv2_woman.wav")
     
     # Load model
     print("Loading model...")
-    audio_processor = load_audio_model(model_path="/workspace/personaplex-work/echomimic_v2/pretrained_weights/audio_processor/tiny.pt", device="cuda", model_type="whisper")
+    audio_processor = load_audio_model(model_path=os.path.join(os.path.dirname(os.path.abspath(__file__)), "echomimic_v2", "pretrained_weights", "audio_processor", "tiny.pt"), device="cuda", model_type="whisper")
     
     # 1. Path input
     feat_path = audio_processor.audio2feat(audio_path)

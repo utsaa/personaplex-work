@@ -1,12 +1,14 @@
 import sys
-sys.path.insert(0, "/workspace/personaplex-work/web_app")
-sys.path.insert(0, "/workspace/personaplex-work/echomimic_v2")
+import os
+_base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(_base_dir, "web_app"))
+sys.path.insert(0, os.path.join(_base_dir, "echomimic_v2"))
 
 from core.trt.manager import TRTEngineManager
 
-manager = TRTEngineManager(echomimic_dir="/workspace/personaplex-work/echomimic_v2")
-unet_pt_path = "/workspace/personaplex-work/echomimic_v2/pretrained_weights/denoising_unet_acc.pth"
-base_model_path = "/workspace/personaplex-work/echomimic_v2/pretrained_weights/sd-image-variations-diffusers"
+manager = TRTEngineManager(echomimic_dir=os.path.join(_base_dir, "echomimic_v2"))
+unet_pt_path = os.path.join(_base_dir, "echomimic_v2", "pretrained_weights", "denoising_unet_acc.pth")
+base_model_path = os.path.join(_base_dir, "echomimic_v2", "pretrained_weights", "sd-image-variations-diffusers")
 
 print("Starting FULL TRT Export + Build Pipeline...")
 for f in [12]:

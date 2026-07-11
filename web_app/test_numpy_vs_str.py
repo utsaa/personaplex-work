@@ -2,13 +2,14 @@ import sys
 import numpy as np
 import torch
 import soundfile as sf
-sys.path.append("/workspace/personaplex-work/echomimic_v2")
+import os
+sys.path.append(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "echomimic_v2"))
 from src.models.whisper.audio2feature import Audio2Feature
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
-audio_guider = Audio2Feature(model_path="/workspace/personaplex-work/echomimic_v2/pretrained_weights/audio_processor/tiny.pt", device=device)
+audio_guider = Audio2Feature(model_path=os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "echomimic_v2", "pretrained_weights", "audio_processor", "tiny.pt"), device=device)
 
-wav_path = "/workspace/personaplex-work/echomimic_v2/assets/halfbody_demo/audio/chinese/echomimicv2_woman.wav"
+wav_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "echomimic_v2", "assets", "halfbody_demo", "audio", "chinese", "echomimicv2_woman.wav")
 audio_np, sr = sf.read(wav_path)
 audio_np = audio_np.mean(axis=1) # Convert to mono
 audio_np = audio_np.astype(np.float32)

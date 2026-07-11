@@ -39,6 +39,9 @@ dependencies = [
     "pywin32 ; sys_platform == 'win32'",
     "colorama",
     "imageio[ffmpeg]>=2.37.3",
+    "fastapi>=0.139.0",
+    "uvicorn>=0.51.0",
+    "websockets>=16.1",
 ]
 
 [project.optional-dependencies]
